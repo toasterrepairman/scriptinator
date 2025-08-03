@@ -1,5 +1,5 @@
 use gtk::prelude::*;
-use gtk::{Application, Box, Orientation, Label, ScrolledWindow, gdk, CssProvider, Align, Entry, DropDown, StringList, MenuButton, Popover, ProgressBar};
+use gtk::{Application, Box, Orientation, Label, ScrolledWindow, gdk, CssProvider, Align, Entry, DropDown, StringList, MenuButton, Popover};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -159,17 +159,6 @@ fn main() {
             .title_widget(&Label::new(Some("Scriptinator")))
             .build();
 
-        // Create the loading bar
-        let loading_bar = ProgressBar::new();
-        loading_bar.set_fraction(0.0);
-        loading_bar.set_show_text(false);
-        loading_bar.set_width_request(120);
-        loading_bar.set_height_request(4);
-        loading_bar.set_valign(Align::Center);
-
-        // Pack the loading bar on the left side of the header
-        header_bar.pack_start(&loading_bar);
-
         // Create hamburger menu with settings
         let menu_button = MenuButton::builder()
             .icon_name("open-menu-symbolic")
@@ -294,19 +283,6 @@ fn main() {
                 color: alpha(@theme_fg_color, 0.8);
                 font-style: italic;
             }
-            progressbar {
-                min-height: 4px;
-                border-radius: 2px;
-            }
-            progressbar > trough {
-                background-color: alpha(@theme_fg_color, 0.1);
-                border-radius: 2px;
-            }
-            progressbar > trough > progress {
-                background: linear-gradient(90deg, @accent_color, alpha(@accent_color, 0.7));
-                border-radius: 2px;
-                transition: all 100ms ease;
-            }
             "#,
         );
         gtk::style_context_add_provider_for_display(
@@ -325,16 +301,6 @@ fn main() {
         window.present();
 
         let (tx, rx) = mpsc::channel::<(String, Option<String>, String)>();
-        let (progress_tx, progress_rx) = mpsc::channel::<f64>();
-
-        // Progress bar update handler
-        let loading_bar_clone = loading_bar.clone();
-        glib::idle_add_local(move || {
-            if let Ok(progress) = progress_rx.try_recv() {
-                loading_bar_clone.set_fraction(progress);
-            }
-            glib::ControlFlow::Continue
-        });
 
         glib::idle_add_local(move || {
             if let Ok((original, translated, timestamp)) = rx.try_recv() {
@@ -403,25 +369,6 @@ fn main() {
             while running_clone_for_thread.load(Ordering::Relaxed) {
                 let device_index = selected_device_index.load(Ordering::Relaxed);
                 let device = devices.get(device_index).unwrap_or(&default_device);
-
-                // Start timing the 5-second capture
-                let capture_start = Instant::now();
-                let capture_duration = Duration::from_secs(8);
-
-                // Start a separate thread to update the progress bar during capture
-                let progress_tx_clone = progress_tx.clone();
-                let running_clone_for_progress = Arc::clone(&running_clone_for_thread);
-                thread::spawn(move || {
-                    let start_time = Instant::now();
-                    while running_clone_for_progress.load(Ordering::Relaxed) && start_time.elapsed() < capture_duration {
-                        let elapsed = start_time.elapsed();
-                        let progress = elapsed.as_secs_f64() / capture_duration.as_secs_f64();
-                        let _ = progress_tx_clone.send(progress.min(1.0));
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                    // Reset progress bar when capture is complete
-                    let _ = progress_tx_clone.send(0.0);
-                });
 
                 if let Some(audio_snippet) = capture_audio_snippet(device) {
                     audio_buffer.extend_from_slice(&audio_snippet);
