@@ -42,8 +42,6 @@
         libsecret
         cmake
         ffmpeg
-        llvmPackages.libclang
-        llvmPackages.libcxxClang
         # llvmPackages.libclang
         #
         # cudaPackages.cuda_nvcc
@@ -76,10 +74,10 @@
         cargoLock.lockFile = ./Cargo.lock;
 
         postBuild = ''
-            # for desktop files
-            install -Dt $out/share/applications resources/scriptinator.desktop
+          # for desktop files
+          install -Dt $out/share/applications resources/scriptinator.desktop
 
-            install -Dt $out/share/icons resources/icon-scriptinator.png
+          install -Dt $out/share/icons resources/icon-scriptinator.png
         '';
         postInstall = ''
           wrapProgram $out/bin/scriptinator \
@@ -110,7 +108,6 @@
         '';
         # CUDA_ROOT = "${pkgs.cudaPackages.cudatoolkit}";
         buildInputs = [(rustVersion.override {extensions = ["rust-src"];})];
-        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
       };
 
       meta = with nixpkgs.lib; {
