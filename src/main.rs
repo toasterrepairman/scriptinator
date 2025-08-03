@@ -1,11 +1,12 @@
 use gtk::prelude::*;
-use gtk::{Application, ApplicationWindow, ComboBoxText, Box, Orientation, Label, ScrolledWindow, gdk, CssProvider};
+use gtk::{Application, Box, Orientation, Label, ScrolledWindow, gdk, CssProvider, Align, Entry, DropDown, StringList, MenuButton, Popover};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
-use glib::{self, ControlFlow};
+// Use the glib re-exported by gtk4 to avoid version conflicts
+use gtk::glib;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use chrono::Local;
 use reqwest;
@@ -14,17 +15,29 @@ use tokio;
 use std::io::Write;
 use tempfile::NamedTempFile;
 use reqwest::multipart;
-use tokio::fs::File;
-use tokio::io::AsyncReadExt;
+// Import libadwaita prelude for extension traits
+use libadwaita::prelude::*;
+use libadwaita::{HeaderBar, PreferencesGroup, ActionRow, ApplicationWindow as AdwApplicationWindow};
 
-// Configuration for the local OpenAI backend
-const LOCAL_OPENAI_URL: &str = "http://localhost:11434"; // Default Ollama URL
-const TRANSCRIPTION_MODEL: &str = "whisper"; // Model name for transcription
-const CHAT_MODEL: &str = "llama3"; // Model name for chat completions/translation
+// --- Runtime-configurable Settings ---
+struct AppSettings {
+    openai_url: Mutex<String>,
+    transcription_model: Mutex<String>,
+    chat_model: Mutex<String>,
+}
+
+impl AppSettings {
+    fn new() -> Self {
+        Self {
+            openai_url: Mutex::new("http://localhost:11434".to_string()),
+            transcription_model: Mutex::new("whisper".to_string()),
+            chat_model: Mutex::new("llama3".to_string()),
+        }
+    }
+}
 
 fn get_audio_devices() -> Vec<String> {
     println!("Getting available audio devices...");
-
     let output = Command::new("pactl")
         .args(["list", "short", "sources"])
         .output();
@@ -32,7 +45,7 @@ fn get_audio_devices() -> Vec<String> {
     match output {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let devices: Vec<String> = stdout
+            stdout
                 .lines()
                 .filter_map(|line| {
                     let parts: Vec<&str> = line.split('\t').collect();
@@ -42,14 +55,7 @@ fn get_audio_devices() -> Vec<String> {
                         None
                     }
                 })
-                .collect();
-
-            println!("Found {} audio devices:", devices.len());
-            for device in &devices {
-                println!("  - {}", device);
-            }
-
-            devices
+                .collect()
         }
         Err(e) => {
             println!("Error getting audio devices: {}", e);
@@ -60,13 +66,12 @@ fn get_audio_devices() -> Vec<String> {
 
 fn capture_audio_snippet(device: &str) -> Option<Vec<u8>> {
     println!("Capturing 5 seconds of audio from device: {}", device);
-
     let output = Command::new("ffmpeg")
         .args([
             "-f", "pulse", "-i", device, "-t", "5",
-            "-f", "wav", // Changed to WAV for better compatibility
-            "-ar", "16000", // 16kHz sample rate
-            "-ac", "1", // Mono
+            "-f", "wav",
+            "-ar", "16000",
+            "-ac", "1",
             "pipe:1",
         ])
         .output();
@@ -74,7 +79,6 @@ fn capture_audio_snippet(device: &str) -> Option<Vec<u8>> {
     match output {
         Ok(output) => {
             if output.status.success() {
-                println!("Audio capture successful, {} bytes captured", output.stdout.len());
                 if output.stdout.is_empty() {
                     println!("Warning: No audio data captured");
                     None
@@ -94,131 +98,48 @@ fn capture_audio_snippet(device: &str) -> Option<Vec<u8>> {
     }
 }
 
-// Function to handle transcription, always requesting and parsing JSON
-async fn transcribe_with_openai(audio_data: Vec<u8>) -> Option<String> {
-    println!("Transcribing {} bytes of audio with local OpenAI backend...", audio_data.len());
+async fn transcribe_with_openai(audio_data: Vec<u8>, settings: &Arc<AppSettings>) -> Option<String> {
+    let temp_file = NamedTempFile::new().ok()?;
+    temp_file.as_file().write_all(&audio_data).ok()?;
 
-    let mut temp_file = match NamedTempFile::new() {
-        Ok(file) => file,
-        Err(e) => {
-            println!("Failed to create temporary file: {}", e);
-            return None;
-        }
-    };
-
-    if let Err(e) = temp_file.write_all(&audio_data) {
-        println!("Failed to write audio data to temp file: {}", e);
-        return None;
-    }
-
-    let file_part = match multipart::Part::bytes(audio_data).file_name("audio.wav").mime_str("audio/wav") {
-        Ok(part) => part,
-        Err(e) => {
-            println!("Failed to create multipart part: {}", e);
-            return None;
-        }
-    };
+    let file_part = multipart::Part::bytes(audio_data).file_name("audio.wav").mime_str("audio/wav").ok()?;
 
     let client = reqwest::Client::new();
+    let url = format!("{}/v1/audio/transcriptions", settings.openai_url.lock().unwrap());
+    let model = settings.transcription_model.lock().unwrap().clone();
 
     let form = multipart::Form::new()
-        .text("model", TRANSCRIPTION_MODEL)
-        .text("response_format", "json") // Explicitly request JSON format
+        .text("model", model)
+        .text("response_format", "json")
         .part("file", file_part);
 
-    let url = format!("{}/v1/audio/transcriptions", LOCAL_OPENAI_URL);
-
-    match client
-        .post(&url)
-        .multipart(form)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            if response.status().is_success() {
-                match response.json::<serde_json::Value>().await {
-                    Ok(json) => {
-                        if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
-                            let trimmed = text.trim();
-                            println!("Transcription result: '{}'", trimmed);
-                            if trimmed.is_empty() {
-                                println!("Warning: Empty transcription result");
-                                None
-                            } else {
-                                Some(trimmed.to_string())
-                            }
-                        } else {
-                            println!("No 'text' field in JSON response");
-                            None
-                        }
-                    }
-                    Err(e) => {
-                        println!("Failed to parse JSON response: {}", e);
-                        None
-                    }
-                }
-            } else {
-                println!("HTTP error: {}", response.status());
-                None
-            }
-        }
-        Err(e) => {
-            println!("Request failed: {}", e);
-            None
-        }
+    let response = client.post(&url).multipart(form).send().await.ok()?;
+    if response.status().is_success() {
+        let json: serde_json::Value = response.json().await.ok()?;
+        json.get("text").and_then(|v| v.as_str()).map(|s| s.trim().to_string())
+    } else {
+        println!("Transcription HTTP error: {}", response.status());
+        None
     }
 }
 
-// New function to translate text using the chat completions endpoint
-async fn translate_text_with_openai(text: &str) -> Option<String> {
-    println!("Translating text with local OpenAI backend...");
+async fn translate_text_with_openai(text: &str, settings: &Arc<AppSettings>) -> Option<String> {
     let client = reqwest::Client::new();
-    let url = format!("{}/v1/chat/completions", LOCAL_OPENAI_URL);
+    let url = format!("{}/v1/chat/completions", settings.openai_url.lock().unwrap());
+    let model = settings.chat_model.lock().unwrap().clone();
 
     let request_body = json!({
-        "model": CHAT_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": format!("Translate any non-English portions of this text into English. Only provide the translated text as the response: {}", text)
-            }
-        ]
+        "model": model,
+        "messages": [{"role": "user", "content": format!("Translate any non-English portions of this text into English. Only provide the translated text as the response: {}", text)}]
     });
 
-    match client.post(&url).json(&request_body).send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                match response.json::<serde_json::Value>().await {
-                    Ok(json) => {
-                        if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
-                            let trimmed = content.trim();
-                            println!("Translation result: '{}'", trimmed);
-                            if trimmed.is_empty() {
-                                println!("Warning: Empty translation result");
-                                None
-                            } else {
-                                Some(trimmed.to_string())
-                            }
-                        } else {
-                            println!("No content field in JSON response from chat model");
-                            None
-                        }
-                    }
-                    Err(e) => {
-                        println!("Failed to parse JSON response from chat model: {}", e);
-                        None
-                    }
-                }
-            } else {
-                println!("HTTP error from chat model: {}", response.status());
-                println!("Response body: {}", response.text().await.unwrap_or_default());
-                None
-            }
-        }
-        Err(e) => {
-            println!("Request failed for chat model: {}", e);
-            None
-        }
+    let response = client.post(&url).json(&request_body).send().await.ok()?;
+    if response.status().is_success() {
+        let json: serde_json::Value = response.json().await.ok()?;
+        json["choices"][0]["message"]["content"].as_str().map(|s| s.trim().to_string())
+    } else {
+        println!("Translation HTTP error: {}", response.status());
+        None
     }
 }
 
@@ -228,65 +149,148 @@ fn main() {
         .build();
 
     app.connect_activate(|app| {
-        // --- Graceful Shutdown Flag ---
         let running = Arc::new(AtomicBool::new(true));
-
-        // Get available audio devices
+        let settings = Arc::new(AppSettings::new());
         let devices = get_audio_devices();
+        let main_vbox = Box::new(Orientation::Vertical, 0);
 
-        // 1) Build UI
-        let main_vbox = Box::new(Orientation::Vertical, 10);
-        main_vbox.set_margin_top(10);
-        main_vbox.set_margin_bottom(10);
-        main_vbox.set_margin_start(10);
-        main_vbox.set_margin_end(10);
+        let header_bar = HeaderBar::builder()
+            .show_end_title_buttons(true)
+            .title_widget(&Label::new(Some("Scriptinator")))
+            .build();
 
+        // Create hamburger menu with settings
+        let menu_button = MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .build();
+
+        // Create settings popover content
+        let settings_box = Box::new(Orientation::Vertical, 12);
+        settings_box.set_margin_start(12);
+        settings_box.set_margin_end(12);
+        settings_box.set_margin_top(12);
+        settings_box.set_margin_bottom(12);
+
+        // Audio Input Settings Group
+        let audio_group = PreferencesGroup::new();
+        audio_group.set_title("Audio Settings");
+
+        let audio_row = ActionRow::new();
+        audio_row.set_title("Audio Input Device");
+
+        let device_list = StringList::new(&[]);
+        for device in &devices {
+            device_list.append(device);
+        }
+        let device_dropdown = DropDown::builder()
+            .model(&device_list)
+            .selected(0)
+            .valign(Align::Center)
+            .build();
+
+        audio_row.add_suffix(&device_dropdown);
+        audio_group.add(&audio_row);
+        settings_box.append(&audio_group);
+
+        // API Settings Group
+        let api_group = PreferencesGroup::new();
+        api_group.set_title("API Settings");
+
+        let url_row = ActionRow::new();
+        url_row.set_title("OpenAI-compatible URL");
+        let url_entry = Entry::new();
+        url_entry.set_text(&settings.openai_url.lock().unwrap());
+        url_entry.set_valign(Align::Center);
+        url_entry.set_width_chars(30);
+        url_row.add_suffix(&url_entry);
+        api_group.add(&url_row);
+
+        let transcription_row = ActionRow::new();
+        transcription_row.set_title("Transcription Model");
+        let transcription_entry = Entry::new();
+        transcription_entry.set_text(&settings.transcription_model.lock().unwrap());
+        transcription_entry.set_valign(Align::Center);
+        transcription_entry.set_width_chars(20);
+        transcription_row.add_suffix(&transcription_entry);
+        api_group.add(&transcription_row);
+
+        let chat_row = ActionRow::new();
+        chat_row.set_title("Chat Model");
+        let chat_entry = Entry::new();
+        chat_entry.set_text(&settings.chat_model.lock().unwrap());
+        chat_entry.set_valign(Align::Center);
+        chat_entry.set_width_chars(20);
+        chat_row.add_suffix(&chat_entry);
+        api_group.add(&chat_row);
+
+        settings_box.append(&api_group);
+
+        let settings_popover = Popover::builder()
+            .child(&settings_box)
+            .build();
+        menu_button.set_popover(Some(&settings_popover));
+        header_bar.pack_end(&menu_button);
+
+        main_vbox.append(&header_bar);
+
+        // Main content area - just the scrolled window with messages
         let scrolled_window = ScrolledWindow::new();
         scrolled_window.set_vexpand(true);
-        let cards_container = Box::new(Orientation::Vertical, 0);
+        scrolled_window.set_margin_start(12);
+        scrolled_window.set_margin_end(12);
+        scrolled_window.set_margin_top(12);
+        scrolled_window.set_margin_bottom(12);
+
+        let cards_container = Box::new(Orientation::Vertical, 8);
         scrolled_window.set_child(Some(&cards_container));
         main_vbox.append(&scrolled_window);
 
-        let header_bar = gtk::HeaderBar::new();
-
-        let header_device_combo = ComboBoxText::new();
-        for device in &devices {
-            header_device_combo.append_text(device);
-        }
-        header_device_combo.set_active(Some(0));
-        header_bar.pack_end(&header_device_combo);
-
-        let window = ApplicationWindow::builder()
+        let window = AdwApplicationWindow::builder()
             .application(app)
             .default_width(600)
-            .default_height(400)
-            .child(&main_vbox)
+            .default_height(700)
+            .content(&main_vbox)
+            .title("Scriptinator")
             .build();
 
-        window.set_titlebar(Some(&header_bar));
-
-        // --- CSS Styling ---
         let provider = CssProvider::new();
-        provider.load_from_data("
+        provider.load_from_data(
+            r#"
             .card {
-                padding: 12px;
-                margin-bottom: 8px;
-                border: 1px solid #d8dee9;
-                border-radius: 4px;
-                box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.1);
+                padding: 16px;
+                margin: 4px 0;
+                border: 1px solid alpha(@borders, 0.3);
+                border-radius: 8px;
+                background-color: alpha(@theme_base_color, 0.1);
+                backdrop-filter: blur(10px);
+                box-shadow: 0 2px 8px alpha(@shadow_color, 0.16);
+                transition: all 200ms ease;
+            }
+            .card:hover {
+                background-color: alpha(@theme_base_color, 0.15);
+                box-shadow: 0 4px 16px alpha(@shadow_color, 0.24);
             }
             .timestamp {
-                font-size: 0.8em;
-                color: #888;
+                font-size: 0.85em;
+                color: alpha(@theme_fg_color, 0.6);
+                font-weight: 500;
             }
-        ");
+            .original-text {
+                color: @theme_fg_color;
+                font-weight: 500;
+            }
+            .translated-text {
+                color: alpha(@theme_fg_color, 0.8);
+                font-style: italic;
+            }
+            "#,
+        );
         gtk::style_context_add_provider_for_display(
             &gdk::Display::default().expect("Could not connect to a display."),
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        // --- Graceful Shutdown Logic ---
         let running_clone_for_close = running.clone();
         window.connect_close_request(move |_| {
             println!("Close request received, signaling worker thread to exit.");
@@ -296,132 +300,93 @@ fn main() {
 
         window.present();
 
-        // 2) Channel - now sends (original_text, optional_translated_text, timestamp)
         let (tx, rx) = mpsc::channel::<(String, Option<String>, String)>();
-
-        // Poll the receiver in the main thread to add new cards
         glib::idle_add_local(move || {
-            if let Ok((original_text, translated_text, timestamp)) = rx.try_recv() {
-                let card = Box::new(Orientation::Vertical, 5); // Changed to Vertical to stack labels
+            if let Ok((original, translated, timestamp)) = rx.try_recv() {
+                let card = Box::new(Orientation::Vertical, 8);
                 card.add_css_class("card");
 
-                let original_label = Label::new(Some(&original_text));
-                original_label.set_wrap(true);
-                original_label.set_xalign(0.0);
-                original_label.set_halign(gtk::Align::Start);
+                let original_label = Label::builder()
+                    .label(&original)
+                    .wrap(true)
+                    .xalign(0.0)
+                    .css_classes(vec!["original-text"])
+                    .build();
                 card.append(&original_label);
 
-                if let Some(translation) = translated_text {
-                    let translated_label = Label::new(Some(&format!("(Translated): {}", translation)));
-                    translated_label.set_wrap(true);
-                    translated_label.set_xalign(0.0);
-                    translated_label.set_halign(gtk::Align::Start);
+                if let Some(translation) = translated {
+                    let translated_label = Label::builder()
+                        .label(&format!("→ {}", translation))
+                        .wrap(true)
+                        .xalign(0.0)
+                        .css_classes(vec!["translated-text"])
+                        .build();
                     card.append(&translated_label);
                 }
 
-                let timestamp_label = Label::new(Some(&timestamp));
-                timestamp_label.set_halign(gtk::Align::End);
-                timestamp_label.set_hexpand(true);
-                timestamp_label.add_css_class("timestamp");
+                let timestamp_label = Label::builder()
+                    .label(&timestamp)
+                    .halign(Align::End)
+                    .css_classes(vec!["timestamp"])
+                    .build();
                 card.append(&timestamp_label);
 
-                // Prepend the new card to add it to the top
                 cards_container.prepend(&card);
             }
-            ControlFlow::Continue
+            glib::ControlFlow::Continue
         });
 
-        // 3) Worker thread with async runtime
         let selected_device_index = Arc::new(AtomicUsize::new(0));
         let selected_device_index_clone = selected_device_index.clone();
-        let devices_clone = devices.clone();
-
-        header_device_combo.connect_changed(move |combo| {
-            if let Some(active) = combo.active() {
-                selected_device_index_clone.store(active as usize, Ordering::Relaxed);
-            }
+        device_dropdown.connect_selected_notify(move |dropdown| {
+            selected_device_index_clone.store(dropdown.selected() as usize, Ordering::Relaxed);
         });
 
-        let running_clone_for_thread = running.clone();
-        std::thread::spawn(move || {
-            // Create async runtime for the worker thread
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    let _ = tx.send((format!("Failed to create async runtime: {}", e), None, "".to_string()));
-                    return;
-                }
-            };
+        // Settings change handlers
+        let settings_clone_for_url_entry = Arc::clone(&settings);
+        url_entry.connect_changed(move |entry| {
+            *settings_clone_for_url_entry.openai_url.lock().unwrap() = entry.text().to_string();
+        });
 
-            let tx_clone = tx.clone();
-            println!("Testing connection to local OpenAI backend...");
+        let settings_clone_for_transcription = Arc::clone(&settings);
+        transcription_entry.connect_changed(move |entry| {
+            *settings_clone_for_transcription.transcription_model.lock().unwrap() = entry.text().to_string();
+        });
 
-            // Test the connection first
-            rt.block_on(async {
-                let client = reqwest::Client::new();
-                let test_url = format!("{}/v1/models", LOCAL_OPENAI_URL);
+        let settings_clone_for_chat = Arc::clone(&settings);
+        chat_entry.connect_changed(move |entry| {
+            *settings_clone_for_chat.chat_model.lock().unwrap() = entry.text().to_string();
+        });
 
-                match client.get(&test_url).send().await {
-                    Ok(response) => {
-                        if response.status().is_success() {
-                            let _ = tx_clone.send(("Connected to local OpenAI backend. Starting audio capture...".to_string(), None, "".to_string()));
-                        } else {
-                            let _ = tx_clone.send((format!("Backend responded with status: {}", response.status()), None, "".to_string()));
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx_clone.send((format!("Failed to connect to backend at {}: {}", LOCAL_OPENAI_URL, e), None, "".to_string()));
-                        return;
-                    }
-                }
-            });
-
+        let running_clone_for_thread = Arc::clone(&running);
+        let settings_clone_for_thread = Arc::clone(&settings);
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
             let mut audio_buffer: Vec<u8> = Vec::new();
-
-            // --- Main processing loop ---
+            let default_device = "default".to_string();
             while running_clone_for_thread.load(Ordering::Relaxed) {
                 let device_index = selected_device_index.load(Ordering::Relaxed);
-                let default_device = "default".to_string();
-                let device = devices_clone.get(device_index).unwrap_or(&default_device);
-
+                let device = devices.get(device_index).unwrap_or(&default_device);
                 if let Some(audio_snippet) = capture_audio_snippet(device) {
                     audio_buffer.extend_from_slice(&audio_snippet);
-
-                    // Process when we have enough audio data (adjust threshold as needed)
-                    if audio_buffer.len() > 200000 {
+                    if audio_buffer.len() > 200_000 {
                         let audio_to_transcribe = audio_buffer.clone();
                         audio_buffer.clear();
-
-                        // Run transcription and translation in async context
-                        let (original_text, translated_text) = rt.block_on(async {
-                            let transcription_result = transcribe_with_openai(audio_to_transcribe).await;
-                            if let Some(transcribed_text) = &transcription_result {
-                                let translation_result = translate_text_with_openai(transcribed_text).await;
-                                (transcription_result, translation_result)
-                            } else {
-                                (transcription_result, None)
-                            }
-                        });
-
-                        if let Some(text) = original_text {
-                            if !text.trim().is_empty() {
-                                let timestamp = Local::now().format("%H:%M:%S").to_string();
-                                if tx.send((text, translated_text, timestamp)).is_err() {
-                                    break; // Main thread has disconnected
+                        let settings = Arc::clone(&settings_clone_for_thread);
+                        let tx = tx.clone();
+                        rt.spawn(async move {
+                            if let Some(transcribed) = transcribe_with_openai(audio_to_transcribe, &settings).await {
+                                if !transcribed.trim().is_empty() {
+                                    let translated = translate_text_with_openai(&transcribed, &settings).await;
+                                    let timestamp = Local::now().format("%H:%M:%S").to_string();
+                                    let _ = tx.send((transcribed, translated, timestamp));
                                 }
                             }
-                        }
-                    }
-                } else {
-                    if tx.send(("Audio capture failed".to_string(), None, "".to_string())).is_err() {
-                        break; // Main thread has disconnected
+                        });
                     }
                 }
-
-                // Sleep for a short duration
-                std::thread::sleep(Duration::from_millis(200));
+                thread::sleep(Duration::from_millis(200));
             }
-            println!("Worker thread has terminated.");
         });
     });
 
