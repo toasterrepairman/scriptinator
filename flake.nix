@@ -75,7 +75,7 @@
 
         postBuild = ''
           # for desktop files
-          # install -Dt $out/share/applications resources/scriptinator.desktop
+          install -Dt $out/share/applications resources/scriptinator.desktop
 
           # install -Dt $out/share/icons resources/icon-scriptinator.png
         '';
