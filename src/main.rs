@@ -539,7 +539,7 @@ fn main() {
         welcome_box.append(&welcome_subtitle);
 
         let welcome_description = Label::builder()
-            .label("To get started:\n\n1. Download the Whisper model from settings (one-time setup)\n2. Select an audio input device or application\n3. Click 'Start Recording' to begin transcription\n\nThe app will automatically capture and transcribe audio from your selected source.")
+            .label("To get started, download the Whisper model from settings (one-time setup) and click 'Start Recording' to begin transcription.")
             .wrap(true)
             .justify(gtk::Justification::Center)
             .css_classes(vec!["body"])
