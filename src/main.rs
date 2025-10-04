@@ -37,7 +37,7 @@ impl AppSettings {
         println!("Downloading model from HuggingFace...");
         let api = Api::new()?;
         let repo = api.model("ggerganov/whisper.cpp".to_string());
-        let model_file = repo.get("ggml-base-q8_0.bin")?;
+        let model_file = repo.get("ggml-small-q8_0.bin")?;
 
         let path_str = model_file.to_string_lossy().to_string();
         *self.model_path.lock().unwrap() = Some(path_str.clone());
@@ -329,8 +329,17 @@ fn transcribe_with_whisper(audio_data: Vec<u8>, settings: &Arc<AppSettings>) -> 
         beam_size: 5,
         patience: -1.0,
     });
-    params.set_suppress_nst(true);
+    params.set_suppress_nst(false);
     params.set_suppress_blank(true);
+    params.set_language(Some("en"));
+    params.set_no_speech_thold(3.0);
+    // Disable fallback temperatures (prevents hallucinations when uncertain)
+    params.set_temperature_inc(0.0);
+    // Set initial prompt to discourage common hallucinations
+    params.set_initial_prompt("");
+    // Set probability thresholds
+    params.set_max_initial_ts(1.0);
+
 
     // Create state and run transcription
     let mut state = ctx.create_state().expect("failed to create state");
@@ -434,7 +443,7 @@ fn main() {
 
         let model_row = ActionRow::new();
         model_row.set_title("Whisper Model");
-        model_row.set_subtitle("ggml-base-q8_0.bin from HuggingFace");
+        model_row.set_subtitle("ggml-small-q8_0.bin from HuggingFace");
 
         let download_button = Button::builder()
             .label("Download Model")
