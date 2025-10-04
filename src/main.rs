@@ -8,25 +8,21 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use chrono::Local;
-use reqwest;
-use serde_json::json;
-use tokio;
 use std::io::{Write, Read, BufReader, BufRead};
 use libadwaita::prelude::*;
 use libadwaita::{HeaderBar, PreferencesGroup, ActionRow, ApplicationWindow as AdwApplicationWindow};
 use std::collections::VecDeque;
-use base64::Engine;
+use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
 
 // --- Runtime-configurable Settings ---
 struct AppSettings {
-    kobold_url: Mutex<String>,
-    // Removed transcription_model since KoboldCPP handles this internally
+    model_path: Mutex<String>,
 }
 
 impl AppSettings {
     fn new() -> Self {
         Self {
-            kobold_url: Mutex::new("http://localhost:5001".to_string()), // Default KoboldCPP port
+            model_path: Mutex::new("/path/to/whisper/model".to_string()), // Set to your model path
         }
     }
 }
@@ -270,51 +266,44 @@ fn get_running_applications() -> Vec<(String, String)> {
     applications
 }
 
-async fn translate_with_kobold(audio_data: Vec<u8>, settings: &Arc<AppSettings>) -> Option<String> {
-    // Create WAV header for the raw PCM data
-    let mut wav_data = Vec::new();
+fn transcribe_with_whisper(audio_data: Vec<u8>, settings: &Arc<AppSettings>) -> Option<String> {
+    // Convert raw PCM data to float samples
+    let mut float_audio = Vec::new();
+    for chunk in audio_data.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
+        float_audio.push(sample);
+    }
 
-    wav_data.extend_from_slice(b"RIFF");
-    wav_data.extend_from_slice(&(36u32 + audio_data.len() as u32).to_le_bytes());
-    wav_data.extend_from_slice(b"WAVE");
-    wav_data.extend_from_slice(b"fmt ");
-    wav_data.extend_from_slice(&16u32.to_le_bytes());
-    wav_data.extend_from_slice(&1u16.to_le_bytes());
-    wav_data.extend_from_slice(&1u16.to_le_bytes());
-    wav_data.extend_from_slice(&16000u32.to_le_bytes());
-    wav_data.extend_from_slice(&32000u32.to_le_bytes());
-    wav_data.extend_from_slice(&2u16.to_le_bytes());
-    wav_data.extend_from_slice(&16u16.to_le_bytes());
-    wav_data.extend_from_slice(b"data");
-    wav_data.extend_from_slice(&(audio_data.len() as u32).to_le_bytes());
-    wav_data.extend_from_slice(&audio_data);
+    // Load model
+    let model_path = settings.model_path.lock().unwrap();
+    let ctx = WhisperContext::new_with_params(
+        &*model_path,
+        WhisperContextParameters::default()
+    ).expect("failed to load model");
 
-    // Encode WAV data to base64
-    let base64_data = base64::engine::general_purpose::STANDARD.encode(&wav_data);
-
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/extra/transcribe", settings.kobold_url.lock().unwrap());
-
-    let request_body = json!({
-        "prompt": "",
-        "suppress_non_speech": false,
-        "langcode": "en", // Always translate to English
-        "audio_data": base64_data
+    // Create params with suppress_non_speech enabled
+    let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+        beam_size: 5,
+        patience: -1.0,
     });
+    params.set_suppress_nst(true);
 
-    let response = client.post(&url)
-        .json(&request_body)
-        .header("Content-Type", "application/json")
-        .send()
-        .await
-        .ok()?;
+    // Create state and run transcription
+    let mut state = ctx.create_state().expect("failed to create state");
+    state
+        .full(params, &float_audio[..])
+        .expect("failed to run model");
 
-    if response.status().is_success() {
-        let json: serde_json::Value = response.json().await.ok()?;
-        json.get("text").and_then(|v| v.as_str()).map(|s| s.trim().to_string())
-    } else {
-        println!("KoboldCPP translation HTTP error: {} - Response: {:?}", response.status(), response.text().await.ok());
+    // Collect results
+    let mut result = String::new();
+    for segment in state.as_iter() {
+        result.push_str(&format!("{}", segment));
+    }
+
+    if result.trim().is_empty() {
         None
+    } else {
+        Some(result.trim().to_string())
     }
 }
 
@@ -390,16 +379,16 @@ fn main() {
         settings_box.append(&audio_group);
 
         let api_group = PreferencesGroup::new();
-        api_group.set_title("KoboldCPP Settings");
+        api_group.set_title("Whisper Settings");
 
-        let url_row = ActionRow::new();
-        url_row.set_title("KoboldCPP URL");
-        let url_entry = Entry::new();
-        url_entry.set_text(&settings.kobold_url.lock().unwrap());
-        url_entry.set_valign(Align::Center);
-        url_entry.set_width_chars(30);
-        url_row.add_suffix(&url_entry);
-        api_group.add(&url_row);
+        let model_row = ActionRow::new();
+        model_row.set_title("Model Path");
+        let model_entry = Entry::new();
+        model_entry.set_text(&settings.model_path.lock().unwrap());
+        model_entry.set_valign(Align::Center);
+        model_entry.set_width_chars(30);
+        model_row.add_suffix(&model_entry);
+        api_group.add(&model_row);
 
         settings_box.append(&api_group);
 
@@ -411,6 +400,36 @@ fn main() {
 
         main_vbox.append(&header_bar);
 
+        // Create welcome screen
+        let welcome_box = GtkBox::new(Orientation::Vertical, 12);
+        welcome_box.set_valign(Align::Center);
+        welcome_box.set_halign(Align::Center);
+        welcome_box.set_margin_top(48);
+        welcome_box.set_margin_bottom(48);
+        welcome_box.set_margin_start(48);
+        welcome_box.set_margin_end(48);
+
+        let welcome_title = Label::builder()
+            .label("Scriptinator")
+            .css_classes(vec!["title-1"])
+            .build();
+        welcome_box.append(&welcome_title);
+
+        let welcome_subtitle = Label::builder()
+            .label("Real-time audio transcription with Whisper")
+            .css_classes(vec!["title-2"])
+            .build();
+        welcome_box.append(&welcome_subtitle);
+
+        let welcome_description = Label::builder()
+            .label("To get started:\n\n1. Select an audio input device or application\n2. Set the path to your Whisper model\n3. Click 'Start Recording' to begin transcription\n\nThe app will automatically capture and transcribe audio from your selected source.")
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(vec!["body"])
+            .build();
+        welcome_box.append(&welcome_description);
+
+        // Create scrolled window for transcription results
         let scrolled_window = ScrolledWindow::new();
         scrolled_window.set_vexpand(true);
         scrolled_window.set_margin_start(12);
@@ -420,6 +439,8 @@ fn main() {
 
         let cards_container = GtkBox::new(Orientation::Vertical, 8);
         scrolled_window.set_child(Some(&cards_container));
+
+        main_vbox.append(&welcome_box);
         main_vbox.append(&scrolled_window);
 
         let window = AdwApplicationWindow::builder()
@@ -456,6 +477,18 @@ fn main() {
                 color: @theme_fg_color;
                 font-weight: 500;
             }
+            .title-1 {
+                font-size: 24px;
+                font-weight: bold;
+            }
+            .title-2 {
+                font-size: 18px;
+                color: alpha(@theme_fg_color, 0.8);
+            }
+            .body {
+                font-size: 14px;
+                color: alpha(@theme_fg_color, 0.9);
+            }
             "#,
         );
         gtk::style_context_add_provider_for_display(
@@ -473,15 +506,22 @@ fn main() {
 
         window.present();
 
+        // Channel for sending transcriptions to UI
         let (tx, rx) = mpsc::channel::<(String, String)>();
         let rx = Arc::new(Mutex::new(rx));
 
+        // Buffer to keep only 25 messages
+        let message_buffer: Arc<Mutex<VecDeque<gtk::Widget>>> = Arc::new(Mutex::new(VecDeque::new()));
+
         let rx_clone = Arc::clone(&rx);
+        let message_buffer_clone = Arc::clone(&message_buffer);
         glib::timeout_add_local(Duration::from_millis(250), move || {
             let mut has_message = false;
             if let Ok(rx) = rx_clone.try_lock() {
                 if let Ok((translated, timestamp)) = rx.try_recv() {
                     has_message = true;
+
+                    // Create new card
                     let card = GtkBox::new(Orientation::Vertical, 8);
                     card.add_css_class("card");
 
@@ -500,6 +540,19 @@ fn main() {
                         .build();
                     card.append(&timestamp_label);
 
+                    // Add to buffer
+                    if let Ok(mut buffer) = message_buffer_clone.try_lock() {
+                        buffer.push_front(card.clone().into());
+
+                        // Remove oldest if more than 25
+                        if buffer.len() > 25 {
+                            if let Some(old_card) = buffer.pop_back() {
+                                cards_container.remove(&old_card);
+                            }
+                        }
+                    }
+
+                    // Add to UI
                     cards_container.prepend(&card);
                 }
             }
@@ -519,15 +572,17 @@ fn main() {
             selected_app_index_clone.store(dropdown.selected() as usize, Ordering::Relaxed);
         });
 
-        let settings_clone_for_url_entry = Arc::clone(&settings);
-        url_entry.connect_changed(move |entry| {
-            *settings_clone_for_url_entry.kobold_url.lock().unwrap() = entry.text().to_string();
+        let settings_clone_for_model_entry = Arc::clone(&settings);
+        model_entry.connect_changed(move |entry| {
+            *settings_clone_for_model_entry.model_path.lock().unwrap() = entry.text().to_string();
         });
 
         let (control_tx, control_rx) = mpsc::channel::<bool>();
 
         let running_clone_for_button = Arc::clone(&running);
         let control_tx_clone = control_tx.clone();
+        let welcome_box_clone = welcome_box.clone();
+        let scrolled_window_clone = scrolled_window.clone();
         start_stop_button.connect_clicked(move |button| {
             let is_running = running_clone_for_button.load(Ordering::Relaxed);
             if is_running {
@@ -538,13 +593,16 @@ fn main() {
                 button.set_label("Stop Recording");
                 running_clone_for_button.store(true, Ordering::Relaxed);
                 let _ = control_tx_clone.send(true);
+
+                // Switch from welcome screen to transcription view
+                main_vbox.remove(&welcome_box_clone);
+                main_vbox.append(&scrolled_window_clone);
             }
         });
 
         let running_clone_for_thread = Arc::clone(&running);
         let settings_clone_for_thread = Arc::clone(&settings);
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
             let mut audio_capture = AudioCapture::new();
             let default_device = "default".to_string();
 
@@ -565,8 +623,9 @@ fn main() {
                                     let settings = Arc::clone(&settings_clone_for_thread);
                                     let tx = tx.clone();
 
-                                    rt.spawn(async move {
-                                        if let Some(translated) = translate_with_kobold(audio_data, &settings).await {
+                                    // Process transcription in a separate thread to avoid blocking
+                                    thread::spawn(move || {
+                                        if let Some(translated) = transcribe_with_whisper(audio_data, &settings) {
                                             if !translated.trim().is_empty() {
                                                 let timestamp = Local::now().format("%H:%M:%S").to_string();
                                                 let _ = tx.send((translated, timestamp));

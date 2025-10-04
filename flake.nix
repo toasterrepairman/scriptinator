@@ -42,7 +42,15 @@
         libsecret
         cmake
         ffmpeg
-        # llvmPackages.libclang
+        shaderc
+        vulkan-headers
+        vulkan-loader
+        ninja
+        which
+        makeWrapper
+        clang
+        stdenv.cc.cc.lib   # stdc++ linking
+        llvmPackages.libclang
         #
         # cudaPackages.cuda_nvcc
         # cudaPackages.cuda_cudart
@@ -100,6 +108,7 @@
             export GST_PLUGIN_SYSTEM_PATH_1_0=$GST_PLUGIN_SYSTEM_PATH_1_0:${pkgs.gst_all_1.gst-plugins-bad}/lib/gstreamer-1.0
             export GST_PLUGIN_SYSTEM_PATH_1_0=$GST_PLUGIN_SYSTEM_PATH_1_0:${pkgs.gst_all_1.gst-plugins-ugly}/lib/gstreamer-1.0
             export GST_PLUGIN_SYSTEM_PATH_1_0=$GST_PLUGIN_SYSTEM_PATH_1_0:${pkgs.gst_all_1.gst-libav}/lib/gstreamer-1.0
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
             # Set GStreamer debug level (optional)
             # export GST_DEBUG=3,GstPipeline:4,GstMemory:5,GstPoll:5 RUST_BACKTRACE=1 admiral
@@ -108,6 +117,7 @@
         '';
         # CUDA_ROOT = "${pkgs.cudaPackages.cudatoolkit}";
         buildInputs = [(rustVersion.override {extensions = ["rust-src"];})];
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
       };
 
       meta = with nixpkgs.lib; {
