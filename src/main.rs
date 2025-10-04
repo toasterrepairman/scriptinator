@@ -12,25 +12,21 @@ use reqwest;
 use serde_json::json;
 use tokio;
 use std::io::{Write, Read, BufReader, BufRead};
-use tempfile::NamedTempFile;
-use reqwest::multipart;
 use libadwaita::prelude::*;
 use libadwaita::{HeaderBar, PreferencesGroup, ActionRow, ApplicationWindow as AdwApplicationWindow};
 use std::collections::VecDeque;
+use base64::Engine;
 
 // --- Runtime-configurable Settings ---
 struct AppSettings {
-    openai_url: Mutex<String>,
-    transcription_model: Mutex<String>,
-    chat_model: Mutex<String>,
+    kobold_url: Mutex<String>,
+    // Removed transcription_model since KoboldCPP handles this internally
 }
 
 impl AppSettings {
     fn new() -> Self {
         Self {
-            openai_url: Mutex::new("http://localhost:11434".to_string()),
-            transcription_model: Mutex::new("whisper".to_string()),
-            chat_model: Mutex::new("llama3".to_string()),
+            kobold_url: Mutex::new("http://localhost:5001".to_string()), // Default KoboldCPP port
         }
     }
 }
@@ -57,9 +53,9 @@ impl AudioCapture {
             last_significant_audio: Instant::now(),
             last_api_call: Instant::now(),
             is_recording: AtomicBool::new(false),
-            silence_threshold: 0.01, // Amplitude threshold for silence detection
-            silence_duration: Duration::from_secs(2), // Cut off after 2 seconds of silence
-            min_api_interval: Duration::from_secs(3), // Minimum 3 seconds between API calls
+            silence_threshold: 0.01,
+            silence_duration: Duration::from_secs(2),
+            min_api_interval: Duration::from_secs(3),
         }
     }
 
@@ -71,7 +67,6 @@ impl AudioCapture {
         let mut sum_squares = 0i64;
         let sample_count = audio_data.len() / 2;
 
-        // Convert bytes to 16-bit samples and calculate RMS
         for chunk in audio_data.chunks_exact(2) {
             let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
             sum_squares += (sample * sample) as i64;
@@ -79,8 +74,6 @@ impl AudioCapture {
 
         let mean_square = sum_squares as f64 / sample_count as f64;
         let rms = mean_square.sqrt();
-
-        // Normalize to 0.0-1.0 range (32768 is max value for 16-bit audio)
         (rms / 32768.0) as f32
     }
 
@@ -91,21 +84,17 @@ impl AudioCapture {
 
         println!("Starting continuous audio recording from device: {}", device);
 
-        // If recording from an application, we need to use a different approach
         if device.starts_with("app:") {
-            let app_id = &device[4..]; // Remove "app:" prefix
+            let app_id = &device[4..];
 
-            // Create a null sink to route application audio
             let _null_sink = Command::new("pactl")
                 .args(["load-module", "module-null-sink", &format!("sink_name=capture_sink_{}", app_id)])
                 .output();
 
-            // Move the application to our null sink
             let _move_app = Command::new("pactl")
                 .args(["move-sink-input", app_id, &format!("capture_sink_{}", app_id)])
                 .output();
 
-            // Record from the monitor of our null sink
             let monitor_name = format!("capture_sink_{}.monitor", app_id);
             let mut child = Command::new("ffmpeg")
                 .args([
@@ -124,7 +113,6 @@ impl AudioCapture {
 
             self.process = Some(child);
         } else {
-            // Regular device recording
             let mut child = Command::new("ffmpeg")
                 .args([
                     "-f", "pulse",
@@ -160,14 +148,13 @@ impl AudioCapture {
         if let Some(ref mut process) = self.process {
             if let Some(ref mut stdout) = process.stdout {
                 let mut reader = BufReader::new(stdout);
-                let mut temp_buffer = [0u8; 8192]; // Read in 8KB chunks
+                let mut temp_buffer = [0u8; 8192];
 
                 match reader.read(&mut temp_buffer) {
                     Ok(bytes_read) if bytes_read > 0 => {
                         self.buffer.extend(&temp_buffer[..bytes_read]);
 
-                        // Check audio amplitude to detect speech
-                        if self.buffer.len() > 16000 { // At least 0.5 seconds of audio
+                        if self.buffer.len() > 16000 {
                             let recent_audio: Vec<u8> = self.buffer.iter().rev().take(16000).rev().cloned().collect();
                             let amplitude = self.calculate_rms_amplitude(&recent_audio);
 
@@ -176,27 +163,21 @@ impl AudioCapture {
                             }
                         }
 
-                        // Process audio if we have enough data AND either:
-                        // 1. It's been 3+ seconds since last transcription, OR
-                        // 2. We've had 2+ seconds of silence after detecting speech
-                        let should_process = self.buffer.len() > 144_000 && // At least 1.5 seconds
+                        let should_process = self.buffer.len() > 144_000 &&
                             (self.last_transcription.elapsed() > Duration::from_secs(3) ||
-                             (self.buffer.len() > 288_000 && // At least 3 seconds
+                             (self.buffer.len() > 288_000 &&
                               self.last_significant_audio.elapsed() > self.silence_duration));
 
                         if should_process {
                             let audio_data: Vec<u8> = self.buffer.drain(..).collect();
-                            self.last_significant_audio = Instant::now();
-                            self.last_significant_audio = Instant::now();
+                            self.last_transcription = Instant::now();
                             return Some(audio_data);
                         }
                     }
                     Ok(_) => {
-                        // No data available right now, sleep briefly to avoid busy waiting
                         thread::sleep(Duration::from_millis(100));
                     }
                     Err(_) => {
-                        // Error reading, restart recording
                         self.stop_recording();
                         return None;
                     }
@@ -275,7 +256,6 @@ fn get_running_applications() -> Vec<(String, String)> {
                 }
             }
 
-            // Don't forget the last one
             if let Some(id) = current_id {
                 if let Some(app) = current_app {
                     applications.push((format!("app:{}", id), app));
@@ -290,66 +270,50 @@ fn get_running_applications() -> Vec<(String, String)> {
     applications
 }
 
-async fn transcribe_with_openai(audio_data: Vec<u8>, settings: &Arc<AppSettings>) -> Option<String> {
+async fn translate_with_kobold(audio_data: Vec<u8>, settings: &Arc<AppSettings>) -> Option<String> {
     // Create WAV header for the raw PCM data
     let mut wav_data = Vec::new();
 
-    // WAV header (44 bytes)
     wav_data.extend_from_slice(b"RIFF");
     wav_data.extend_from_slice(&(36u32 + audio_data.len() as u32).to_le_bytes());
     wav_data.extend_from_slice(b"WAVE");
     wav_data.extend_from_slice(b"fmt ");
-    wav_data.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
-    wav_data.extend_from_slice(&1u16.to_le_bytes());  // PCM format
-    wav_data.extend_from_slice(&1u16.to_le_bytes());  // mono
-    wav_data.extend_from_slice(&16000u32.to_le_bytes()); // sample rate
-    wav_data.extend_from_slice(&32000u32.to_le_bytes()); // byte rate
-    wav_data.extend_from_slice(&2u16.to_le_bytes());  // block align
-    wav_data.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav_data.extend_from_slice(&16u32.to_le_bytes());
+    wav_data.extend_from_slice(&1u16.to_le_bytes());
+    wav_data.extend_from_slice(&1u16.to_le_bytes());
+    wav_data.extend_from_slice(&16000u32.to_le_bytes());
+    wav_data.extend_from_slice(&32000u32.to_le_bytes());
+    wav_data.extend_from_slice(&2u16.to_le_bytes());
+    wav_data.extend_from_slice(&16u16.to_le_bytes());
     wav_data.extend_from_slice(b"data");
     wav_data.extend_from_slice(&(audio_data.len() as u32).to_le_bytes());
     wav_data.extend_from_slice(&audio_data);
 
-    let file_part = multipart::Part::bytes(wav_data)
-        .file_name("audio.wav")
-        .mime_str("audio/wav")
-        .ok()?;
+    // Encode WAV data to base64
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&wav_data);
 
     let client = reqwest::Client::new();
-    let url = format!("{}/v1/audio/transcriptions", settings.openai_url.lock().unwrap());
-    let model = settings.transcription_model.lock().unwrap().clone();
+    let url = format!("{}/api/extra/transcribe", settings.kobold_url.lock().unwrap());
 
-    let form = multipart::Form::new()
-        .text("model", model)
-        .text("response_format", "json")
-        .part("file", file_part);
+    let request_body = json!({
+        "prompt": "",
+        "suppress_non_speech": false,
+        "langcode": "en", // Always translate to English
+        "audio_data": base64_data
+    });
 
-    let response = client.post(&url).multipart(form).send().await.ok()?;
+    let response = client.post(&url)
+        .json(&request_body)
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .ok()?;
+
     if response.status().is_success() {
         let json: serde_json::Value = response.json().await.ok()?;
         json.get("text").and_then(|v| v.as_str()).map(|s| s.trim().to_string())
     } else {
-        println!("Transcription HTTP error: {}", response.status());
-        None
-    }
-}
-
-async fn translate_text_with_openai(text: &str, settings: &Arc<AppSettings>) -> Option<String> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/v1/chat/completions", settings.openai_url.lock().unwrap());
-    let model = settings.chat_model.lock().unwrap().clone();
-
-    let request_body = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": format!("Translate any non-English portions of this text into English. Only provide the translated text as the response: {}", text)}]
-    });
-
-    let response = client.post(&url).json(&request_body).send().await.ok()?;
-    if response.status().is_success() {
-        let json: serde_json::Value = response.json().await.ok()?;
-        json["choices"][0]["message"]["content"].as_str().map(|s| s.trim().to_string())
-    } else {
-        println!("Translation HTTP error: {}", response.status());
+        println!("KoboldCPP translation HTTP error: {} - Response: {:?}", response.status(), response.text().await.ok());
         None
     }
 }
@@ -360,7 +324,7 @@ fn main() {
         .build();
 
     app.connect_activate(|app| {
-        let running = Arc::new(AtomicBool::new(false)); // Start paused
+        let running = Arc::new(AtomicBool::new(false));
         let settings = Arc::new(AppSettings::new());
         let devices = get_audio_devices();
         let applications = get_running_applications();
@@ -371,29 +335,24 @@ fn main() {
             .title_widget(&Label::new(Some("Scriptinator")))
             .build();
 
-        // Add start/stop button
         let start_stop_button = Button::builder()
             .label("Start Recording")
             .build();
         header_bar.pack_start(&start_stop_button);
 
-        // Create hamburger menu with settings
         let menu_button = MenuButton::builder()
             .icon_name("open-menu-symbolic")
             .build();
 
-        // Create settings popover content
         let settings_box = GtkBox::new(Orientation::Vertical, 12);
         settings_box.set_margin_start(12);
         settings_box.set_margin_end(12);
         settings_box.set_margin_top(12);
         settings_box.set_margin_bottom(12);
 
-        // Audio Input Settings Group
         let audio_group = PreferencesGroup::new();
         audio_group.set_title("Audio Settings");
 
-        // Device selection row
         let audio_row = ActionRow::new();
         audio_row.set_title("Audio Input Device");
 
@@ -410,7 +369,6 @@ fn main() {
         audio_row.add_suffix(&device_dropdown);
         audio_group.add(&audio_row);
 
-        // Application selection row
         let app_row = ActionRow::new();
         app_row.set_title("Running Applications");
         app_row.set_subtitle("Select an application to record its audio");
@@ -431,36 +389,17 @@ fn main() {
 
         settings_box.append(&audio_group);
 
-        // API Settings Group
         let api_group = PreferencesGroup::new();
-        api_group.set_title("API Settings");
+        api_group.set_title("KoboldCPP Settings");
 
         let url_row = ActionRow::new();
-        url_row.set_title("OpenAI-compatible URL");
+        url_row.set_title("KoboldCPP URL");
         let url_entry = Entry::new();
-        url_entry.set_text(&settings.openai_url.lock().unwrap());
+        url_entry.set_text(&settings.kobold_url.lock().unwrap());
         url_entry.set_valign(Align::Center);
         url_entry.set_width_chars(30);
         url_row.add_suffix(&url_entry);
         api_group.add(&url_row);
-
-        let transcription_row = ActionRow::new();
-        transcription_row.set_title("Transcription Model");
-        let transcription_entry = Entry::new();
-        transcription_entry.set_text(&settings.transcription_model.lock().unwrap());
-        transcription_entry.set_valign(Align::Center);
-        transcription_entry.set_width_chars(20);
-        transcription_row.add_suffix(&transcription_entry);
-        api_group.add(&transcription_row);
-
-        let chat_row = ActionRow::new();
-        chat_row.set_title("Chat Model");
-        let chat_entry = Entry::new();
-        chat_entry.set_text(&settings.chat_model.lock().unwrap());
-        chat_entry.set_valign(Align::Center);
-        chat_entry.set_width_chars(20);
-        chat_row.add_suffix(&chat_entry);
-        api_group.add(&chat_row);
 
         settings_box.append(&api_group);
 
@@ -472,7 +411,6 @@ fn main() {
 
         main_vbox.append(&header_bar);
 
-        // Main content area - just the scrolled window with messages
         let scrolled_window = ScrolledWindow::new();
         scrolled_window.set_vexpand(true);
         scrolled_window.set_margin_start(12);
@@ -514,13 +452,9 @@ fn main() {
                 color: alpha(@theme_fg_color, 0.6);
                 font-weight: 500;
             }
-            .original-text {
+            .translated-text {
                 color: @theme_fg_color;
                 font-weight: 500;
-            }
-            .translated-text {
-                color: alpha(@theme_fg_color, 0.8);
-                font-style: italic;
             }
             "#,
         );
@@ -539,36 +473,25 @@ fn main() {
 
         window.present();
 
-        let (tx, rx) = mpsc::channel::<(String, Option<String>, String)>();
+        let (tx, rx) = mpsc::channel::<(String, String)>();
         let rx = Arc::new(Mutex::new(rx));
 
-        // Use a proper event-driven approach instead of continuous polling
         let rx_clone = Arc::clone(&rx);
         glib::timeout_add_local(Duration::from_millis(250), move || {
             let mut has_message = false;
             if let Ok(rx) = rx_clone.try_lock() {
-                if let Ok((original, translated, timestamp)) = rx.try_recv() {
+                if let Ok((translated, timestamp)) = rx.try_recv() {
                     has_message = true;
                     let card = GtkBox::new(Orientation::Vertical, 8);
                     card.add_css_class("card");
 
-                    let original_label = Label::builder()
-                        .label(&original)
+                    let translated_label = Label::builder()
+                        .label(&translated)
                         .wrap(true)
                         .xalign(0.0)
-                        .css_classes(vec!["original-text"])
+                        .css_classes(vec!["translated-text"])
                         .build();
-                    card.append(&original_label);
-
-                    if let Some(translation) = translated {
-                        let translated_label = Label::builder()
-                            .label(&format!("→ {}", translation))
-                            .wrap(true)
-                            .xalign(0.0)
-                            .css_classes(vec!["translated-text"])
-                            .build();
-                        card.append(&translated_label);
-                    }
+                    card.append(&translated_label);
 
                     let timestamp_label = Label::builder()
                         .label(&timestamp)
@@ -580,7 +503,6 @@ fn main() {
                     cards_container.prepend(&card);
                 }
             }
-            // Continue the timer regardless of whether we had messages
             glib::ControlFlow::Continue
         });
 
@@ -597,26 +519,13 @@ fn main() {
             selected_app_index_clone.store(dropdown.selected() as usize, Ordering::Relaxed);
         });
 
-        // Settings change handlers
         let settings_clone_for_url_entry = Arc::clone(&settings);
         url_entry.connect_changed(move |entry| {
-            *settings_clone_for_url_entry.openai_url.lock().unwrap() = entry.text().to_string();
+            *settings_clone_for_url_entry.kobold_url.lock().unwrap() = entry.text().to_string();
         });
 
-        let settings_clone_for_transcription = Arc::clone(&settings);
-        transcription_entry.connect_changed(move |entry| {
-            *settings_clone_for_transcription.transcription_model.lock().unwrap() = entry.text().to_string();
-        });
-
-        let settings_clone_for_chat = Arc::clone(&settings);
-        chat_entry.connect_changed(move |entry| {
-            *settings_clone_for_chat.chat_model.lock().unwrap() = entry.text().to_string();
-        });
-
-        // Channel for controlling the audio capture thread
         let (control_tx, control_rx) = mpsc::channel::<bool>();
 
-        // Start/Stop button handler
         let running_clone_for_button = Arc::clone(&running);
         let control_tx_clone = control_tx.clone();
         start_stop_button.connect_clicked(move |button| {
@@ -632,7 +541,6 @@ fn main() {
             }
         });
 
-        // Audio capture and processing thread
         let running_clone_for_thread = Arc::clone(&running);
         let settings_clone_for_thread = Arc::clone(&settings);
         thread::spawn(move || {
@@ -641,7 +549,6 @@ fn main() {
             let default_device = "default".to_string();
 
             loop {
-                // Wait for start/stop commands - this blocks and doesn't consume CPU
                 match control_rx.recv() {
                     Ok(should_run) => {
                         if should_run {
@@ -653,24 +560,21 @@ fn main() {
                                 continue;
                             }
 
-                            // Main recording loop
                             while running_clone_for_thread.load(Ordering::Relaxed) {
                                 if let Some(audio_data) = audio_capture.read_audio_data() {
                                     let settings = Arc::clone(&settings_clone_for_thread);
                                     let tx = tx.clone();
 
                                     rt.spawn(async move {
-                                        if let Some(transcribed) = transcribe_with_openai(audio_data, &settings).await {
-                                            if !transcribed.trim().is_empty() {
-                                                let translated = translate_text_with_openai(&transcribed, &settings).await;
+                                        if let Some(translated) = translate_with_kobold(audio_data, &settings).await {
+                                            if !translated.trim().is_empty() {
                                                 let timestamp = Local::now().format("%H:%M:%S").to_string();
-                                                let _ = tx.send((transcribed, translated, timestamp));
+                                                let _ = tx.send((translated, timestamp));
                                             }
                                         }
                                     });
                                 }
 
-                                // Check for stop command without blocking
                                 if let Ok(false) = control_rx.try_recv() {
                                     break;
                                 }
@@ -680,7 +584,6 @@ fn main() {
                         }
                     }
                     Err(_) => {
-                        // Channel closed, exit thread
                         break;
                     }
                 }
