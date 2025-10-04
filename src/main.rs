@@ -1,5 +1,5 @@
 use gtk::prelude::*;
-use gtk::{Application, Box as GtkBox, Orientation, Label, ScrolledWindow, gdk, CssProvider, Align, Entry, DropDown, StringList, MenuButton, Popover, Button};
+use gtk::{Application, Box as GtkBox, Orientation, Label, ScrolledWindow, gdk, CssProvider, Align, DropDown, StringList, MenuButton, Popover, Button};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,17 +13,38 @@ use libadwaita::prelude::*;
 use libadwaita::{HeaderBar, PreferencesGroup, ActionRow, ApplicationWindow as AdwApplicationWindow};
 use std::collections::VecDeque;
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
+use hf_hub::api::sync::Api;
 
 // --- Runtime-configurable Settings ---
 struct AppSettings {
-    model_path: Mutex<String>,
+    model_path: Mutex<Option<String>>,
+    model_downloaded: AtomicBool,
 }
 
 impl AppSettings {
     fn new() -> Self {
         Self {
-            model_path: Mutex::new("/path/to/whisper/model".to_string()), // Set to your model path
+            model_path: Mutex::new(None),
+            model_downloaded: AtomicBool::new(false),
         }
+    }
+
+    fn get_or_download_model(&self) -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(path) = self.model_path.lock().unwrap().as_ref() {
+            return Ok(path.clone());
+        }
+
+        println!("Downloading model from HuggingFace...");
+        let api = Api::new()?;
+        let repo = api.model("ggerganov/whisper.cpp".to_string());
+        let model_file = repo.get("ggml-base-q8_0.bin")?;
+
+        let path_str = model_file.to_string_lossy().to_string();
+        *self.model_path.lock().unwrap() = Some(path_str.clone());
+        self.model_downloaded.store(true, Ordering::Relaxed);
+
+        println!("Model downloaded to: {}", path_str);
+        Ok(path_str)
     }
 }
 
@@ -184,6 +205,21 @@ impl AudioCapture {
     }
 }
 
+fn get_default_source() -> Option<String> {
+    let output = Command::new("pactl")
+        .args(["get-default-sink"])
+        .output()
+        .ok()?;
+
+    let default_sink = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if default_sink.is_empty() {
+        None
+    } else {
+        // For sinks, we want the monitor source
+        Some(format!("{}.monitor", default_sink))
+    }
+}
+
 fn get_audio_devices() -> Vec<String> {
     println!("Getting available audio devices...");
     let output = Command::new("pactl")
@@ -275,9 +311,16 @@ fn transcribe_with_whisper(audio_data: Vec<u8>, settings: &Arc<AppSettings>) -> 
     }
 
     // Load model
-    let model_path = settings.model_path.lock().unwrap();
+    let model_path = match settings.get_or_download_model() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("Failed to get model: {}", e);
+            return None;
+        }
+    };
+
     let ctx = WhisperContext::new_with_params(
-        &*model_path,
+        &model_path,
         WhisperContextParameters::default()
     ).expect("failed to load model");
 
@@ -287,6 +330,7 @@ fn transcribe_with_whisper(audio_data: Vec<u8>, settings: &Arc<AppSettings>) -> 
         patience: -1.0,
     });
     params.set_suppress_nst(true);
+    params.set_suppress_blank(true);
 
     // Create state and run transcription
     let mut state = ctx.create_state().expect("failed to create state");
@@ -316,6 +360,7 @@ fn main() {
         let running = Arc::new(AtomicBool::new(false));
         let settings = Arc::new(AppSettings::new());
         let devices = get_audio_devices();
+        let default_source = get_default_source();
         let applications = get_running_applications();
         let main_vbox = GtkBox::new(Orientation::Vertical, 0);
 
@@ -346,12 +391,18 @@ fn main() {
         audio_row.set_title("Audio Input Device");
 
         let device_list = StringList::new(&[]);
-        for device in &devices {
+        let mut default_index = 0;
+        for (idx, device) in devices.iter().enumerate() {
             device_list.append(device);
+            if let Some(ref default) = default_source {
+                if device == default {
+                    default_index = idx as u32;
+                }
+            }
         }
         let device_dropdown = DropDown::builder()
             .model(&device_list)
-            .selected(0)
+            .selected(default_index)
             .valign(Align::Center)
             .build();
 
@@ -382,12 +433,69 @@ fn main() {
         api_group.set_title("Whisper Settings");
 
         let model_row = ActionRow::new();
-        model_row.set_title("Model Path");
-        let model_entry = Entry::new();
-        model_entry.set_text(&settings.model_path.lock().unwrap());
-        model_entry.set_valign(Align::Center);
-        model_entry.set_width_chars(30);
-        model_row.add_suffix(&model_entry);
+        model_row.set_title("Whisper Model");
+        model_row.set_subtitle("ggml-base-q8_0.bin from HuggingFace");
+
+        let download_button = Button::builder()
+            .label("Download Model")
+            .valign(Align::Center)
+            .build();
+
+        let model_status_label = Label::builder()
+            .label("Not downloaded")
+            .valign(Align::Center)
+            .build();
+
+        // Channel for download status updates
+        let (download_tx, download_rx) = mpsc::channel::<Result<String, String>>();
+
+        let settings_clone = Arc::clone(&settings);
+        download_button.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            button.set_label("Downloading...");
+
+            let settings = Arc::clone(&settings_clone);
+            let tx = download_tx.clone();
+
+            thread::spawn(move || {
+                match settings.get_or_download_model() {
+                    Ok(path) => {
+                        let _ = tx.send(Ok(path));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e.to_string()));
+                    }
+                }
+            });
+        });
+
+        // Handle download status updates on main thread
+        let download_button_clone = download_button.clone();
+        let status_label_clone = model_status_label.clone();
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            if let Ok(result) = download_rx.try_recv() {
+                match result {
+                    Ok(path) => {
+                        download_button_clone.set_label("Downloaded ✓");
+                        download_button_clone.set_sensitive(false);
+                        status_label_clone.set_label(&format!("Ready: {}",
+                            std::path::Path::new(&path)
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()));
+                    }
+                    Err(e) => {
+                        download_button_clone.set_label("Download Model");
+                        download_button_clone.set_sensitive(true);
+                        status_label_clone.set_label(&format!("Error: {}", e));
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+
+        model_row.add_suffix(&model_status_label);
+        model_row.add_suffix(&download_button);
         api_group.add(&model_row);
 
         settings_box.append(&api_group);
@@ -422,7 +530,7 @@ fn main() {
         welcome_box.append(&welcome_subtitle);
 
         let welcome_description = Label::builder()
-            .label("To get started:\n\n1. Select an audio input device or application\n2. Set the path to your Whisper model\n3. Click 'Start Recording' to begin transcription\n\nThe app will automatically capture and transcribe audio from your selected source.")
+            .label("To get started:\n\n1. Download the Whisper model from settings (one-time setup)\n2. Select an audio input device or application\n3. Click 'Start Recording' to begin transcription\n\nThe app will automatically capture and transcribe audio from your selected source.")
             .wrap(true)
             .justify(gtk::Justification::Center)
             .css_classes(vec!["body"])
@@ -559,7 +667,7 @@ fn main() {
             glib::ControlFlow::Continue
         });
 
-        let selected_device_index = Arc::new(AtomicUsize::new(0));
+        let selected_device_index = Arc::new(AtomicUsize::new(default_index as usize));
         let selected_app_index = Arc::new(AtomicUsize::new(0));
 
         let selected_device_index_clone = selected_device_index.clone();
@@ -570,11 +678,6 @@ fn main() {
         let selected_app_index_clone = selected_app_index.clone();
         app_dropdown.connect_selected_notify(move |dropdown| {
             selected_app_index_clone.store(dropdown.selected() as usize, Ordering::Relaxed);
-        });
-
-        let settings_clone_for_model_entry = Arc::clone(&settings);
-        model_entry.connect_changed(move |entry| {
-            *settings_clone_for_model_entry.model_path.lock().unwrap() = entry.text().to_string();
         });
 
         let (control_tx, control_rx) = mpsc::channel::<bool>();
