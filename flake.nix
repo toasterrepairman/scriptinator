@@ -45,7 +45,6 @@
         shaderc
         vulkan-headers
         vulkan-loader
-        ninja
         which
         makeWrapper
         clang
@@ -78,6 +77,7 @@
         src = ./.; # the folder with the cargo.toml
         nativeBuildInputs = packageDeps;
         buildInputs = packageDeps;
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
         cargoLock.lockFile = ./Cargo.lock;
 
