@@ -179,8 +179,8 @@ impl AudioCapture {
                             let recent_audio: Vec<u8> = self.buffer.iter().rev().take(16000).rev().cloned().collect();
                             let amplitude = self.calculate_rms_amplitude(&recent_audio);
 
-                            println!("Current amplitude: {:.6}, threshold: {:.6}, silence elapsed: {:.1}s",
-                                amplitude, self.silence_threshold, self.last_significant_audio.elapsed().as_secs_f32());
+                            // println!("Current amplitude: {:.6}, threshold: {:.6}, silence elapsed: {:.1}s",
+                            //     amplitude, self.silence_threshold, self.last_significant_audio.elapsed().as_secs_f32());
 
                             if amplitude > self.silence_threshold {
                                 self.last_significant_audio = Instant::now();
