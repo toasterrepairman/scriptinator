@@ -748,7 +748,7 @@ fn main() {
                                     thread::spawn(move || {
                                         if let Some(translated) = transcribe_with_whisper(audio_data, &settings) {
                                             if !translated.trim().is_empty() {
-                                                let timestamp = Local::now().format("%H:%M:%S").to_string();
+                                                let timestamp = Local::now().format("%I:%M:%S %p").to_string();
                                                 let _ = tx.send((translated, timestamp));
                                             }
                                         }
