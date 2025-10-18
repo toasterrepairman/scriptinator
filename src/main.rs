@@ -61,6 +61,7 @@ struct AudioCapture {
     silence_duration: Duration,
     min_api_interval: Duration,
     max_buffer_duration: Duration,
+    current_null_sink: Option<String>,
 }
 
 impl AudioCapture {
@@ -77,6 +78,7 @@ impl AudioCapture {
             silence_duration: Duration::from_secs(2),
             min_api_interval: Duration::from_secs(3),
             max_buffer_duration: Duration::from_secs(10),
+            current_null_sink: None,
         }
     }
 
@@ -106,18 +108,49 @@ impl AudioCapture {
         println!("Starting continuous audio recording from device: {}", device);
 
         if device.starts_with("app:") {
-            let app_id = &device[4..];
+            let app_name = &device[4..];
 
-            let _null_sink = Command::new("pactl")
-                .args(["load-module", "module-null-sink", &format!("sink_name=capture_sink_{}", app_id)])
-                .output();
+            // Look up the current sink-input ID for this application
+            let app_id = find_sink_input_by_app_name(app_name)
+                .ok_or_else(|| format!("Could not find sink-input for application: {}", app_name))?;
 
-            let _move_app = Command::new("pactl")
-                .args(["move-sink-input", app_id, &format!("capture_sink_{}", app_id)])
-                .output();
+            let sink_name = format!("scriptinator_capture_{}", app_id);
 
-            let monitor_name = format!("capture_sink_{}.monitor", app_id);
-            let mut child = Command::new("ffmpeg")
+            println!("Creating null sink for application {} (ID {}): {}", app_name, app_id, sink_name);
+
+            // Create a null sink to capture this application's audio
+            let sink_result = Command::new("pactl")
+                .args(["load-module", "module-null-sink", &format!("sink_name={}", sink_name)])
+                .output()?;
+
+            if !sink_result.status.success() {
+                eprintln!("Failed to create null sink: {}", String::from_utf8_lossy(&sink_result.stderr));
+                return Err("Failed to create null sink".into());
+            }
+
+            // Give PulseAudio a moment to create the sink
+            thread::sleep(Duration::from_millis(200));
+
+            // Move the application to the null sink
+            println!("Moving sink-input {} to {}", app_id, sink_name);
+            let move_result = Command::new("pactl")
+                .args(["move-sink-input", &app_id, &sink_name])
+                .output()?;
+
+            if !move_result.status.success() {
+                eprintln!("Failed to move sink-input: {}", String::from_utf8_lossy(&move_result.stderr));
+                // Clean up the null sink if we can't move the app
+                let _ = Command::new("pactl")
+                    .args(["unload-module", "module-null-sink"])
+                    .output();
+                return Err("Failed to move application to null sink".into());
+            }
+
+            // Record from the monitor of the null sink
+            let monitor_name = format!("{}.monitor", sink_name);
+            println!("Recording from monitor: {}", monitor_name);
+
+            let child = Command::new("ffmpeg")
                 .args([
                     "-f", "pulse",
                     "-i", &monitor_name,
@@ -133,8 +166,9 @@ impl AudioCapture {
                 .spawn()?;
 
             self.process = Some(child);
+            self.current_null_sink = Some(sink_name);
         } else {
-            let mut child = Command::new("ffmpeg")
+            let child = Command::new("ffmpeg")
                 .args([
                     "-f", "pulse",
                     "-i", device,
@@ -162,6 +196,32 @@ impl AudioCapture {
             let _ = process.kill();
             let _ = process.wait();
         }
+
+        // Clean up the null sink if one was created
+        if let Some(sink_name) = self.current_null_sink.take() {
+            println!("Cleaning up null sink: {}", sink_name);
+
+            // First, get the module ID for the null sink
+            if let Ok(output) = Command::new("pactl")
+                .args(["list", "short", "modules"])
+                .output() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+
+                // Find the module ID for our sink
+                for line in stdout.lines() {
+                    if line.contains("module-null-sink") && line.contains(&sink_name) {
+                        if let Some(module_id) = line.split_whitespace().next() {
+                            println!("Unloading module {}", module_id);
+                            let _ = Command::new("pactl")
+                                .args(["unload-module", module_id])
+                                .output();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         self.buffer.clear();
     }
 
@@ -262,7 +322,7 @@ fn get_audio_devices() -> Vec<String> {
     }
 }
 
-fn get_running_applications() -> Vec<(String, String)> {
+fn get_running_applications() -> Vec<String> {
     println!("Getting running applications with audio...");
     let output = Command::new("pactl")
         .args(["list", "sink-inputs"])
@@ -273,20 +333,17 @@ fn get_running_applications() -> Vec<(String, String)> {
     match output {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut current_id: Option<String> = None;
             let mut current_app: Option<String> = None;
 
             for line in stdout.lines() {
                 let line = line.trim();
 
                 if line.starts_with("Sink Input #") {
-                    if let Some(id) = current_id.as_ref() {
-                        if let Some(app) = current_app.as_ref() {
-                            applications.push((format!("app:{}", id), app.clone()));
+                    if let Some(app) = current_app.take() {
+                        if !applications.contains(&app) {
+                            applications.push(app);
                         }
                     }
-                    current_id = line.split('#').nth(1).map(|s| s.to_string());
-                    current_app = None;
                 }
 
                 if line.starts_with("application.name = ") {
@@ -302,9 +359,9 @@ fn get_running_applications() -> Vec<(String, String)> {
                 }
             }
 
-            if let Some(id) = current_id {
-                if let Some(app) = current_app {
-                    applications.push((format!("app:{}", id), app));
+            if let Some(app) = current_app {
+                if !applications.contains(&app) {
+                    applications.push(app);
                 }
             }
         }
@@ -314,6 +371,57 @@ fn get_running_applications() -> Vec<(String, String)> {
     }
 
     applications
+}
+
+fn find_sink_input_by_app_name(app_name: &str) -> Option<String> {
+    println!("Looking for sink-input with application name: {}", app_name);
+    let output = Command::new("pactl")
+        .args(["list", "sink-inputs"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut current_id: Option<String> = None;
+    let mut current_app: Option<String> = None;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+
+        if line.starts_with("Sink Input #") {
+            // Check if previous entry matches
+            if let (Some(id), Some(app)) = (&current_id, &current_app) {
+                if app == app_name {
+                    println!("Found sink-input #{} for application: {}", id, app_name);
+                    return Some(id.clone());
+                }
+            }
+            current_id = line.split('#').nth(1).map(|s| s.to_string());
+            current_app = None;
+        }
+
+        if line.starts_with("application.name = ") {
+            current_app = line.split(" = ")
+                .nth(1)
+                .map(|s| s.trim_matches('"').to_string());
+        }
+
+        if line.starts_with("media.name = ") && current_app.is_none() {
+            current_app = line.split(" = ")
+                .nth(1)
+                .map(|s| s.trim_matches('"').to_string());
+        }
+    }
+
+    // Check last entry
+    if let (Some(id), Some(app)) = (current_id, current_app) {
+        if app == app_name {
+            println!("Found sink-input #{} for application: {}", id, app_name);
+            return Some(id);
+        }
+    }
+
+    println!("No sink-input found for application: {}", app_name);
+    None
 }
 
 fn transcribe_with_whisper(audio_data: Vec<u8>, settings: &Arc<AppSettings>) -> Option<String> {
@@ -443,7 +551,7 @@ fn main() {
 
         let app_list = StringList::new(&[]);
         app_list.append("None - Use device above");
-        for (_id, name) in &applications {
+        for name in &applications {
             app_list.append(name);
         }
         let app_dropdown = DropDown::builder()
@@ -753,10 +861,26 @@ fn main() {
                 match control_rx.recv() {
                     Ok(should_run) => {
                         if should_run {
-                            let device_index = selected_device_index.load(Ordering::Relaxed);
-                            let device = devices.get(device_index).unwrap_or(&default_device);
+                            // Check if an application is selected (index > 0 means an app is selected)
+                            let app_index = selected_app_index.load(Ordering::Relaxed);
+                            let device_to_use = if app_index > 0 {
+                                // App selected: index 0 is "None", so app index 1 = applications[0]
+                                let app_idx = app_index - 1;
+                                if let Some(app_name) = applications.get(app_idx) {
+                                    println!("Recording from application: {}", app_name);
+                                    format!("app:{}", app_name)
+                                } else {
+                                    println!("Invalid app index, falling back to device");
+                                    let device_index = selected_device_index.load(Ordering::Relaxed);
+                                    devices.get(device_index).unwrap_or(&default_device).clone()
+                                }
+                            } else {
+                                // No app selected, use device
+                                let device_index = selected_device_index.load(Ordering::Relaxed);
+                                devices.get(device_index).unwrap_or(&default_device).clone()
+                            };
 
-                            if let Err(e) = audio_capture.start_recording(device) {
+                            if let Err(e) = audio_capture.start_recording(&device_to_use) {
                                 println!("Failed to start recording: {}", e);
                                 continue;
                             }
