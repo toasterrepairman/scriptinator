@@ -55,10 +55,12 @@ struct AudioCapture {
     last_transcription: Instant,
     last_significant_audio: Instant,
     last_api_call: Instant,
+    buffer_start_time: Instant,
     is_recording: AtomicBool,
     silence_threshold: f32,
     silence_duration: Duration,
     min_api_interval: Duration,
+    max_buffer_duration: Duration,
 }
 
 impl AudioCapture {
@@ -69,10 +71,12 @@ impl AudioCapture {
             last_transcription: Instant::now(),
             last_significant_audio: Instant::now(),
             last_api_call: Instant::now(),
+            buffer_start_time: Instant::now(),
             is_recording: AtomicBool::new(false),
             silence_threshold: 0.01,
             silence_duration: Duration::from_secs(2),
             min_api_interval: Duration::from_secs(3),
+            max_buffer_duration: Duration::from_secs(10),
         }
     }
 
@@ -175,19 +179,29 @@ impl AudioCapture {
                             let recent_audio: Vec<u8> = self.buffer.iter().rev().take(16000).rev().cloned().collect();
                             let amplitude = self.calculate_rms_amplitude(&recent_audio);
 
+                            println!("Current amplitude: {:.6}, threshold: {:.6}, silence elapsed: {:.1}s",
+                                amplitude, self.silence_threshold, self.last_significant_audio.elapsed().as_secs_f32());
+
                             if amplitude > self.silence_threshold {
                                 self.last_significant_audio = Instant::now();
                             }
                         }
 
-                        let should_process = self.buffer.len() > 144_000 &&
-                            (self.last_transcription.elapsed() > Duration::from_secs(3) ||
-                             (self.buffer.len() > 288_000 &&
-                              self.last_significant_audio.elapsed() > self.silence_duration));
+                        let min_buffer_met = self.buffer.len() > 144_000;
+                        let min_interval_met = self.last_transcription.elapsed() > Duration::from_secs(3);
+                        let silence_detected = self.buffer.len() > 288_000 &&
+                                               self.last_significant_audio.elapsed() > self.silence_duration;
+                        let timeout_triggered = self.buffer_start_time.elapsed() >= self.max_buffer_duration;
+
+                        let should_process = min_buffer_met &&
+                            (min_interval_met || silence_detected || timeout_triggered);
 
                         if should_process {
+                            println!("Processing audio: buffer_size={}, min_interval={}, silence={}, timeout={}",
+                                self.buffer.len(), min_interval_met, silence_detected, timeout_triggered);
                             let audio_data: Vec<u8> = self.buffer.drain(..).collect();
                             self.last_transcription = Instant::now();
+                            self.buffer_start_time = Instant::now();
                             return Some(audio_data);
                         }
                     }
@@ -582,10 +596,12 @@ fn main() {
                     padding: 8px 10px;
                     margin-bottom: 0px;
                     margin-start: 8px;
+                    margin-end: 8px;
                     background-color: alpha(#fff, 0.02);
                     display: block;
                     overflow: hidden;
                     box-sizing: border-box;
+                    max-width: 100%;
                 }
                 .timestamp {
                     color: alpha(#aaa, 0.8);
@@ -598,6 +614,9 @@ fn main() {
                     display: block;
                     word-wrap: break-word;
                     overflow-wrap: break-word;
+                    word-break: break-word;
+                    white-space: normal;
+                    max-width: 100%;
                 }
                 .heading {
                     font-weight: bold;
@@ -654,9 +673,12 @@ fn main() {
                     let translated_label = Label::builder()
                         .label(&translated)
                         .wrap(true)
+                        .wrap_mode(gtk::pango::WrapMode::WordChar)
                         .xalign(0.0)
+                        .max_width_chars(60)
                         .css_classes(vec!["translated-text"])
                         .build();
+                    translated_label.set_width_request(0);
                     card.append(&translated_label);
 
                     let timestamp_label = Label::builder()
