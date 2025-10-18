@@ -569,45 +569,45 @@ fn main() {
             .build();
 
         let provider = CssProvider::new();
-        provider.load_from_data(
-            r#"
-            .card {
-                padding: 16px;
-                margin: 4px 0;
-                border: 1px solid alpha(@borders, 0.3);
-                border-radius: 8px;
-                background-color: alpha(@theme_base_color, 0.1);
-                backdrop-filter: blur(10px);
-                box-shadow: 0 2px 8px alpha(@shadow_color, 0.16);
-                transition: all 200ms ease;
-            }
-            .card:hover {
-                background-color: alpha(@theme_base_color, 0.15);
-                box-shadow: 0 4px 16px alpha(@shadow_color, 0.24);
-            }
-            .timestamp {
-                font-size: 0.85em;
-                color: alpha(@theme_fg_color, 0.6);
-                font-weight: 500;
-            }
-            .translated-text {
-                color: @theme_fg_color;
-                font-weight: 500;
-            }
-            .title-1 {
-                font-size: 24px;
-                font-weight: bold;
-            }
-            .title-2 {
-                font-size: 18px;
-                color: alpha(@theme_fg_color, 0.8);
-            }
-            .body {
-                font-size: 14px;
-                color: alpha(@theme_fg_color, 0.9);
-            }
-            "#,
-        );
+            provider.load_from_data(
+                r#"
+                .card {
+                    border: 1px solid alpha(#999, 0.3);
+                    border-radius: 8px;
+                    padding: 8px;
+                    margin-bottom: 4px;
+                    background-color: alpha(#fff, 0.02);
+                    display: block;
+                    overflow: hidden;
+                    box-sizing: border-box;
+                }
+                .timestamp {
+                    color: alpha(#aaa, 0.8);
+                    font-size: 0.8em;
+                }
+                .translated-text {
+                    font-size: 12pt;
+                    line-height: 1.4;
+                    display: block;
+                    word-wrap: break-word;
+                    overflow-wrap: break-word;
+                    padding-top: 4px;
+                }
+                .title-1 {
+                    font-size: 24px;
+                    font-weight: bold;
+                }
+                .title-2 {
+                    font-size: 18px;
+                    color: alpha(@theme_fg_color, 0.8);
+                }
+                .body {
+                    font-size: 14px;
+                    color: alpha(@theme_fg_color, 0.9);
+                }
+                "#,
+            );
+
         gtk::style_context_add_provider_for_display(
             &gdk::Display::default().expect("Could not connect to a display."),
             &provider,
