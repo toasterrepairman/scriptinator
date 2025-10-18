@@ -62,6 +62,7 @@ struct AudioCapture {
     min_api_interval: Duration,
     max_buffer_duration: Duration,
     current_null_sink: Option<String>,
+    pipewire_loopback_module: Option<String>,
 }
 
 impl AudioCapture {
@@ -79,6 +80,7 @@ impl AudioCapture {
             min_api_interval: Duration::from_secs(3),
             max_buffer_duration: Duration::from_secs(10),
             current_null_sink: None,
+            pipewire_loopback_module: None,
         }
     }
 
@@ -110,44 +112,58 @@ impl AudioCapture {
         if device.starts_with("app:") {
             let app_name = &device[4..];
 
-            // Look up the current sink-input ID for this application
-            let app_id = find_sink_input_by_app_name(app_name)
-                .ok_or_else(|| format!("Could not find sink-input for application: {}", app_name))?;
+            // Find the PipeWire node for this application
+            let node_name = find_pipewire_node_by_app_name(app_name)
+                .ok_or_else(|| format!("Could not find PipeWire node for application: {}", app_name))?;
 
-            let sink_name = format!("scriptinator_capture_{}", app_id);
+            println!("Found PipeWire node: {}", node_name);
 
-            println!("Creating null sink for application {} (ID {}): {}", app_name, app_id, sink_name);
+            // Create a null sink to capture the audio
+            let capture_sink = "scriptinator_capture";
 
-            // Create a null sink to capture this application's audio
-            let sink_result = Command::new("pactl")
-                .args(["load-module", "module-null-sink", &format!("sink_name={}", sink_name)])
+            println!("Creating capture sink...");
+            let module_result = Command::new("pactl")
+                .args([
+                    "load-module",
+                    "module-null-sink",
+                    &format!("sink_name={}", capture_sink),
+                    "sink_properties=device.description='Scriptinator_Capture'",
+                ])
                 .output()?;
 
-            if !sink_result.status.success() {
-                eprintln!("Failed to create null sink: {}", String::from_utf8_lossy(&sink_result.stderr));
-                return Err("Failed to create null sink".into());
+            if !module_result.status.success() {
+                eprintln!("Failed to create capture sink: {}", String::from_utf8_lossy(&module_result.stderr));
+                return Err("Failed to create capture sink".into());
             }
 
-            // Give PulseAudio a moment to create the sink
-            thread::sleep(Duration::from_millis(200));
+            let module_id = String::from_utf8_lossy(&module_result.stdout).trim().to_string();
+            self.current_null_sink = Some(module_id.clone());
 
-            // Move the application to the null sink
-            println!("Moving sink-input {} to {}", app_id, sink_name);
-            let move_result = Command::new("pactl")
-                .args(["move-sink-input", &app_id, &sink_name])
-                .output()?;
+            // Give PipeWire a moment to create the sink
+            thread::sleep(Duration::from_millis(300));
 
-            if !move_result.status.success() {
-                eprintln!("Failed to move sink-input: {}", String::from_utf8_lossy(&move_result.stderr));
-                // Clean up the null sink if we can't move the app
-                let _ = Command::new("pactl")
-                    .args(["unload-module", "module-null-sink"])
-                    .output();
-                return Err("Failed to move application to null sink".into());
-            }
+            // Use PipeWire's pw-loopback to route ONLY this app's audio to our capture sink
+            // This creates a virtual cable from the app to our sink without affecting the app's normal output
+            println!("Creating loopback from {} to {}", node_name, capture_sink);
 
-            // Record from the monitor of the null sink
-            let monitor_name = format!("{}.monitor", sink_name);
+            let loopback_result = Command::new("pw-loopback")
+                .args([
+                    "--capture", &node_name,
+                    "--playback", capture_sink,
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+
+            // Store the loopback process PID for cleanup
+            self.pipewire_loopback_module = Some(loopback_result.id().to_string());
+
+            // Give the loopback time to connect
+            thread::sleep(Duration::from_millis(500));
+
+            // Record from the monitor of our capture sink
+            let monitor_name = format!("{}.monitor", capture_sink);
             println!("Recording from monitor: {}", monitor_name);
 
             let child = Command::new("ffmpeg")
@@ -166,7 +182,6 @@ impl AudioCapture {
                 .spawn()?;
 
             self.process = Some(child);
-            self.current_null_sink = Some(sink_name);
         } else {
             let child = Command::new("ffmpeg")
                 .args([
@@ -197,29 +212,20 @@ impl AudioCapture {
             let _ = process.wait();
         }
 
-        // Clean up the null sink if one was created
-        if let Some(sink_name) = self.current_null_sink.take() {
-            println!("Cleaning up null sink: {}", sink_name);
+        // Kill the pw-loopback process if one was created
+        if let Some(pid) = self.pipewire_loopback_module.take() {
+            println!("Killing pw-loopback process {}", pid);
+            let _ = Command::new("kill")
+                .args([&pid])
+                .output();
+        }
 
-            // First, get the module ID for the null sink
-            if let Ok(output) = Command::new("pactl")
-                .args(["list", "short", "modules"])
-                .output() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-
-                // Find the module ID for our sink
-                for line in stdout.lines() {
-                    if line.contains("module-null-sink") && line.contains(&sink_name) {
-                        if let Some(module_id) = line.split_whitespace().next() {
-                            println!("Unloading module {}", module_id);
-                            let _ = Command::new("pactl")
-                                .args(["unload-module", module_id])
-                                .output();
-                            break;
-                        }
-                    }
-                }
-            }
+        // Clean up the capture sink module if one was created
+        if let Some(module_id) = self.current_null_sink.take() {
+            println!("Unloading module {}", module_id);
+            let _ = Command::new("pactl")
+                .args(["unload-module", &module_id])
+                .output();
         }
 
         self.buffer.clear();
@@ -324,8 +330,10 @@ fn get_audio_devices() -> Vec<String> {
 
 fn get_running_applications() -> Vec<String> {
     println!("Getting running applications with audio...");
-    let output = Command::new("pactl")
-        .args(["list", "sink-inputs"])
+
+    // Try PipeWire first (pw-cli)
+    let output = Command::new("pw-cli")
+        .args(["list-objects"])
         .output();
 
     let mut applications = Vec::new();
@@ -333,44 +341,142 @@ fn get_running_applications() -> Vec<String> {
     match output {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut current_app: Option<String> = None;
 
             for line in stdout.lines() {
                 let line = line.trim();
 
-                if line.starts_with("Sink Input #") {
-                    if let Some(app) = current_app.take() {
-                        if !applications.contains(&app) {
-                            applications.push(app);
+                // Look for application.name in PipeWire node properties
+                if line.contains("application.name =") {
+                    if let Some(name_part) = line.split("application.name = ").nth(1) {
+                        let app_name = name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string();
+                        if !app_name.is_empty() && !applications.contains(&app_name) {
+                            applications.push(app_name);
                         }
                     }
                 }
 
-                if line.starts_with("application.name = ") {
-                    current_app = line.split(" = ")
-                        .nth(1)
-                        .map(|s| s.trim_matches('"').to_string());
-                }
-
-                if line.starts_with("media.name = ") && current_app.is_none() {
-                    current_app = line.split(" = ")
-                        .nth(1)
-                        .map(|s| s.trim_matches('"').to_string());
-                }
-            }
-
-            if let Some(app) = current_app {
-                if !applications.contains(&app) {
-                    applications.push(app);
+                // Also check media.name as fallback
+                if line.contains("media.name =") && applications.is_empty() {
+                    if let Some(name_part) = line.split("media.name = ").nth(1) {
+                        let media_name = name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string();
+                        if !media_name.is_empty() && !applications.contains(&media_name) {
+                            applications.push(media_name);
+                        }
+                    }
                 }
             }
         }
-        Err(e) => {
-            println!("Error getting applications: {}", e);
+        Err(_) => {
+            // Fallback to pactl if pw-cli is not available
+            println!("pw-cli not available, falling back to pactl...");
+            if let Ok(output) = Command::new("pactl").args(["list", "sink-inputs"]).output() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut current_app: Option<String> = None;
+
+                for line in stdout.lines() {
+                    let line = line.trim();
+
+                    if line.starts_with("Sink Input #") {
+                        if let Some(app) = current_app.take() {
+                            if !applications.contains(&app) {
+                                applications.push(app);
+                            }
+                        }
+                    }
+
+                    if line.starts_with("application.name = ") {
+                        current_app = line.split(" = ")
+                            .nth(1)
+                            .map(|s| s.trim_matches('"').to_string());
+                    }
+
+                    if line.starts_with("media.name = ") && current_app.is_none() {
+                        current_app = line.split(" = ")
+                            .nth(1)
+                            .map(|s| s.trim_matches('"').to_string());
+                    }
+                }
+
+                if let Some(app) = current_app {
+                    if !applications.contains(&app) {
+                        applications.push(app);
+                    }
+                }
+            }
         }
     }
 
     applications
+}
+
+fn find_pipewire_node_by_app_name(app_name: &str) -> Option<String> {
+    println!("Looking for PipeWire node with application name: {}", app_name);
+
+    let output = Command::new("pw-cli")
+        .args(["list-objects"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut current_node_id: Option<String> = None;
+    let mut current_node_name: Option<String> = None;
+    let mut current_app_name: Option<String> = None;
+    let mut is_stream = false;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+
+        // Detect node start - look for "id X, type PipeWire:Interface:Node"
+        if line.contains("type PipeWire:Interface:Node") {
+            // Check if previous node matches
+            if let (Some(app), Some(node_name)) = (&current_app_name, &current_node_name) {
+                if app == app_name && is_stream {
+                    println!("Found PipeWire node: {}", node_name);
+                    return Some(node_name.clone());
+                }
+            }
+
+            // Extract node ID from line like "id 123, type PipeWire:Interface:Node"
+            if let Some(id_part) = line.split("id ").nth(1) {
+                if let Some(id_str) = id_part.split(',').next() {
+                    current_node_id = Some(id_str.trim().to_string());
+                }
+            }
+            current_node_name = None;
+            current_app_name = None;
+            is_stream = false;
+        }
+
+        // Check if this is a stream (not a device)
+        if line.contains("media.class =") && line.contains("Stream/Output") {
+            is_stream = true;
+        }
+
+        // Extract node.name
+        if line.contains("node.name =") {
+            if let Some(name_part) = line.split("node.name = ").nth(1) {
+                current_node_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+            }
+        }
+
+        // Extract application.name
+        if line.contains("application.name =") {
+            if let Some(name_part) = line.split("application.name = ").nth(1) {
+                current_app_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+            }
+        }
+    }
+
+    // Check last node
+    if let (Some(app), Some(node_name)) = (current_app_name, current_node_name) {
+        if app == app_name && is_stream {
+            println!("Found PipeWire node: {}", node_name);
+            return Some(node_name);
+        }
+    }
+
+    println!("No PipeWire node found for application: {}", app_name);
+    None
 }
 
 fn find_sink_input_by_app_name(app_name: &str) -> Option<String> {
@@ -421,6 +527,53 @@ fn find_sink_input_by_app_name(app_name: &str) -> Option<String> {
     }
 
     println!("No sink-input found for application: {}", app_name);
+    None
+}
+
+fn get_sink_for_sink_input(sink_input_id: &str) -> Option<String> {
+    println!("Looking for sink for sink-input #{}", sink_input_id);
+    let output = Command::new("pactl")
+        .args(["list", "sink-inputs"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut current_id: Option<String> = None;
+    let mut current_sink: Option<String> = None;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+
+        if line.starts_with("Sink Input #") {
+            // Check if previous entry matches
+            if let Some(id) = &current_id {
+                if id == sink_input_id {
+                    if let Some(sink) = current_sink {
+                        println!("Found sink {} for sink-input #{}", sink, sink_input_id);
+                        return Some(sink);
+                    }
+                }
+            }
+            current_id = line.split('#').nth(1).map(|s| s.to_string());
+            current_sink = None;
+        }
+
+        if line.starts_with("Sink: ") {
+            current_sink = Some(line.split(": ").nth(1)?.to_string());
+        }
+    }
+
+    // Check last entry
+    if let Some(id) = current_id {
+        if id == sink_input_id {
+            if let Some(sink) = current_sink {
+                println!("Found sink {} for sink-input #{}", sink, sink_input_id);
+                return Some(sink);
+            }
+        }
+    }
+
+    println!("No sink found for sink-input #{}", sink_input_id);
     None
 }
 
