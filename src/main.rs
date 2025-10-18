@@ -373,9 +373,14 @@ fn main() {
         let applications = get_running_applications();
         let main_vbox = GtkBox::new(Orientation::Vertical, 0);
 
+        let title_label = Label::builder()
+            .label("Scriptinator")
+            .css_classes(vec!["heading"])
+            .build();
+
         let header_bar = HeaderBar::builder()
             .show_end_title_buttons(true)
-            .title_widget(&Label::new(Some("Scriptinator")))
+            .title_widget(&title_label)
             .build();
 
         let start_stop_button = Button::builder()
@@ -554,7 +559,7 @@ fn main() {
         scrolled_window.set_margin_top(12);
         scrolled_window.set_margin_bottom(12);
 
-        let cards_container = GtkBox::new(Orientation::Vertical, 8);
+        let cards_container = GtkBox::new(Orientation::Vertical, 4);
         scrolled_window.set_child(Some(&cards_container));
 
         main_vbox.append(&welcome_box);
@@ -574,8 +579,9 @@ fn main() {
                 .card {
                     border: 1px solid alpha(#999, 0.3);
                     border-radius: 8px;
-                    padding: 8px;
-                    margin-bottom: 4px;
+                    padding: 8px 10px;
+                    margin-bottom: 0px;
+                    margin-start: 8px;
                     background-color: alpha(#fff, 0.02);
                     display: block;
                     overflow: hidden;
@@ -584,14 +590,17 @@ fn main() {
                 .timestamp {
                     color: alpha(#aaa, 0.8);
                     font-size: 0.8em;
+                    margin-top: 4px;
                 }
                 .translated-text {
-                    font-size: 12pt;
+                    font-size: 11pt;
                     line-height: 1.4;
                     display: block;
                     word-wrap: break-word;
                     overflow-wrap: break-word;
-                    padding-top: 4px;
+                }
+                .heading {
+                    font-weight: bold;
                 }
                 .title-1 {
                     font-size: 24px;
@@ -639,7 +648,7 @@ fn main() {
                     has_message = true;
 
                     // Create new card
-                    let card = GtkBox::new(Orientation::Vertical, 8);
+                    let card = GtkBox::new(Orientation::Vertical, 0);
                     card.add_css_class("card");
 
                     let translated_label = Label::builder()
