@@ -19,6 +19,7 @@ use hf_hub::api::sync::Api;
 struct AppSettings {
     model_path: Mutex<Option<String>>,
     model_downloaded: AtomicBool,
+    selected_model: Mutex<String>,
 }
 
 impl AppSettings {
@@ -26,18 +27,24 @@ impl AppSettings {
         Self {
             model_path: Mutex::new(None),
             model_downloaded: AtomicBool::new(false),
+            selected_model: Mutex::new("ggml-small-q8_0.bin".to_string()),
         }
     }
 
     fn get_or_download_model(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let selected_model = self.selected_model.lock().unwrap().clone();
+
+        // Check if we have a cached path and if it matches the selected model
         if let Some(path) = self.model_path.lock().unwrap().as_ref() {
-            return Ok(path.clone());
+            if path.contains(&selected_model) {
+                return Ok(path.clone());
+            }
         }
 
-        println!("Downloading model from HuggingFace...");
+        println!("Downloading model {} from HuggingFace...", selected_model);
         let api = Api::new()?;
         let repo = api.model("ggerganov/whisper.cpp".to_string());
-        let model_file = repo.get("ggml-small-q8_0.bin")?;
+        let model_file = repo.get(&selected_model)?;
 
         let path_str = model_file.to_string_lossy().to_string();
         *self.model_path.lock().unwrap() = Some(path_str.clone());
@@ -45,6 +52,13 @@ impl AppSettings {
 
         println!("Model downloaded to: {}", path_str);
         Ok(path_str)
+    }
+
+    fn set_selected_model(&self, model_name: String) {
+        *self.selected_model.lock().unwrap() = model_name;
+        // Reset download status so it will download the new model
+        self.model_downloaded.store(false, Ordering::Relaxed);
+        *self.model_path.lock().unwrap() = None;
     }
 }
 
@@ -721,9 +735,40 @@ fn main() {
         let api_group = PreferencesGroup::new();
         api_group.set_title("Whisper Settings");
 
+        // Model selection row
+        let model_selection_row = ActionRow::new();
+        model_selection_row.set_title("Model Selection");
+        model_selection_row.set_subtitle("Choose Whisper model size");
+
+        let model_list = StringList::new(&[
+            "ggml-small-q8_0.bin",
+            "ggml-large-v3-turbo-q8_0.bin"
+        ]);
+        let model_dropdown = DropDown::builder()
+            .model(&model_list)
+            .selected(0)
+            .valign(Align::Center)
+            .build();
+
+        let settings_clone_for_model = Arc::clone(&settings);
+        model_dropdown.connect_selected_notify(move |dropdown| {
+            let selected_idx = dropdown.selected();
+            let model_name = match selected_idx {
+                0 => "ggml-small-q8_0.bin",
+                1 => "ggml-large-v3-turbo-q8_0.bin",
+                _ => "ggml-small-q8_0.bin",
+            };
+            settings_clone_for_model.set_selected_model(model_name.to_string());
+            println!("Model changed to: {}", model_name);
+        });
+
+        model_selection_row.add_suffix(&model_dropdown);
+        api_group.add(&model_selection_row);
+
+        // Model download row
         let model_row = ActionRow::new();
-        model_row.set_title("Whisper Model");
-        model_row.set_subtitle("ggml-small-q8_0.bin from HuggingFace");
+        model_row.set_title("Download Model");
+        model_row.set_subtitle("Download selected model from HuggingFace");
 
         let download_button = Button::builder()
             .label("Download Model")
