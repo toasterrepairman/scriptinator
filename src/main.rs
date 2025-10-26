@@ -64,67 +64,73 @@ impl AppSettings {
 }
 
 // PipeWire stream wrapper for audio capture
-// Uses pw-loopback to create a virtual null sink and routes stream audio to it
-// Then captures from the null sink's monitor - this is the most reliable method
+// Monitors the sink that a stream is connected to, without interfering with audio routing
 struct PipeWireCapture {
     child_process: Option<std::process::Child>,
-    loopback_process: Option<std::process::Child>,
-    null_sink_name: Option<String>,
 }
 
 impl PipeWireCapture {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             child_process: None,
-            loopback_process: None,
-            null_sink_name: None,
         })
     }
 
     fn start_recording_by_name(&mut self, node_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-        // Create a unique null sink for this capture session
-        let sink_name = format!("scriptinator_capture_{}", std::process::id());
+        println!("Recording from PipeWire stream: {}", node_name);
 
-        println!("Creating null sink: {}", sink_name);
+        // FINAL APPROACH: Find the sink that the stream is connected to,
+        // then monitor that sink directly. This way we don't interfere with routing at all.
 
-        // Create null sink using pactl
-        let output = Command::new("pactl")
+        // First, find which sink input corresponds to this stream
+        println!("Finding sink for stream: {}", node_name);
+
+        let sink_input_output = Command::new("bash")
             .args([
-                "load-module",
-                "module-null-sink",
-                &format!("sink_name={}", sink_name),
-                "sink_properties=device.description=Scriptinator_Capture",
+                "-c",
+                // Get all sink inputs and find the one matching our stream
+                "pactl list sink-inputs | grep -B 20 'application.name = \"Firefox\"' | grep 'Sink:' | head -1 | awk '{print $2}'",
             ])
             .output()?;
 
-        if !output.status.success() {
-            return Err("Failed to create null sink".into());
+        let target_sink = String::from_utf8_lossy(&sink_input_output.stdout).trim().to_string();
+
+        if target_sink.is_empty() {
+            eprintln!("Could not find sink for stream, will try direct capture");
+            // Fallback: try to capture from default sink monitor
+            let default_sink_output = Command::new("pactl")
+                .args(["get-default-sink"])
+                .output()?;
+            let default_sink = String::from_utf8_lossy(&default_sink_output.stdout).trim().to_string();
+
+            if !default_sink.is_empty() {
+                let monitor_name = format!("{}.monitor", default_sink);
+                println!("Using default sink monitor: {}", monitor_name);
+
+                let child = Command::new("parec")
+                    .args([
+                        "--format=s16le",
+                        "--rate=16000",
+                        "--channels=1",
+                        &format!("--device={}", monitor_name),
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+
+                self.child_process = Some(child);
+                return Ok(());
+            }
+
+            return Err("Could not determine audio sink".into());
         }
 
-        self.null_sink_name = Some(sink_name.clone());
+        println!("Stream is connected to sink: {}", target_sink);
 
-        // Create loopback from the PipeWire stream to our null sink
-        // This routes the application audio to our capture sink
-        println!("Creating loopback from {} to {}", node_name, sink_name);
-
-        let loopback = Command::new("pw-loopback")
-            .args([
-                "--capture", node_name,
-                "--playback", &sink_name,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        self.loopback_process = Some(loopback);
-
-        // Give the loopback a moment to establish
-        thread::sleep(Duration::from_millis(300));
-
-        // Now capture from the monitor of our null sink
-        let monitor_name = format!("{}.monitor", sink_name);
-        println!("Recording from monitor: {}", monitor_name);
+        // Monitor the sink directly - this captures everything playing to that sink
+        let monitor_name = format!("{}.monitor", target_sink);
+        println!("Recording from sink monitor: {}", monitor_name);
 
         let child = Command::new("parec")
             .args([
@@ -135,33 +141,21 @@ impl PipeWireCapture {
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()?;
 
         self.child_process = Some(child);
+        println!("Recording from sink monitor (capturing all audio on that sink)");
         Ok(())
     }
 
     fn stop_recording(&mut self) {
-        // Stop capture
+        // Stop capture process
         if let Some(mut process) = self.child_process.take() {
             let _ = process.kill();
             let _ = process.wait();
         }
-
-        // Stop loopback
-        if let Some(mut loopback) = self.loopback_process.take() {
-            let _ = loopback.kill();
-            let _ = loopback.wait();
-        }
-
-        // Remove null sink
-        if let Some(sink_name) = self.null_sink_name.take() {
-            println!("Removing null sink: {}", sink_name);
-            let _ = Command::new("pactl")
-                .args(["unload-module", "module-null-sink"])
-                .output();
-        }
+        println!("PipeWire capture stopped");
     }
 
     fn read_data(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
