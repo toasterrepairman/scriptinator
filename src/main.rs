@@ -76,7 +76,7 @@ struct AudioCapture {
     min_api_interval: Duration,
     max_buffer_duration: Duration,
     current_null_sink: Option<String>,
-    pipewire_loopback_module: Option<String>,
+    pipewire_loopback_modules: Vec<String>,
 }
 
 impl AudioCapture {
@@ -94,7 +94,7 @@ impl AudioCapture {
             min_api_interval: Duration::from_secs(3),
             max_buffer_duration: Duration::from_secs(10),
             current_null_sink: None,
-            pipewire_loopback_module: None,
+            pipewire_loopback_modules: Vec::new(),
         }
     }
 
@@ -123,14 +123,10 @@ impl AudioCapture {
 
         println!("Starting continuous audio recording from device: {}", device);
 
-        if device.starts_with("app:") {
-            let app_name = &device[4..];
+        if device.starts_with("stream:") {
+            let node_name = &device[7..];
 
-            // Find the PipeWire node for this application
-            let node_name = find_pipewire_node_by_app_name(app_name)
-                .ok_or_else(|| format!("Could not find PipeWire node for application: {}", app_name))?;
-
-            println!("Found PipeWire node: {}", node_name);
+            println!("Recording from PipeWire stream: {}", node_name);
 
             // Create a null sink to capture the audio
             let capture_sink = "scriptinator_capture";
@@ -156,13 +152,12 @@ impl AudioCapture {
             // Give PipeWire a moment to create the sink
             thread::sleep(Duration::from_millis(300));
 
-            // Use PipeWire's pw-loopback to route ONLY this app's audio to our capture sink
-            // This creates a virtual cable from the app to our sink without affecting the app's normal output
+            // Create a loopback from the stream to our capture sink
             println!("Creating loopback from {} to {}", node_name, capture_sink);
 
             let loopback_result = Command::new("pw-loopback")
                 .args([
-                    "--capture", &node_name,
+                    "--capture", node_name,
                     "--playback", capture_sink,
                 ])
                 .stdin(Stdio::null())
@@ -171,7 +166,7 @@ impl AudioCapture {
                 .spawn()?;
 
             // Store the loopback process PID for cleanup
-            self.pipewire_loopback_module = Some(loopback_result.id().to_string());
+            self.pipewire_loopback_modules.push(loopback_result.id().to_string());
 
             // Give the loopback time to connect
             thread::sleep(Duration::from_millis(500));
@@ -226,8 +221,8 @@ impl AudioCapture {
             let _ = process.wait();
         }
 
-        // Kill the pw-loopback process if one was created
-        if let Some(pid) = self.pipewire_loopback_module.take() {
+        // Kill ALL pw-loopback processes that were created
+        for pid in self.pipewire_loopback_modules.drain(..) {
             println!("Killing pw-loopback process {}", pid);
             let _ = Command::new("kill")
                 .args([&pid])
@@ -342,89 +337,108 @@ fn get_audio_devices() -> Vec<String> {
     }
 }
 
-fn get_running_applications() -> Vec<String> {
-    println!("Getting running applications with audio...");
+fn get_running_applications() -> Vec<(String, String)> {
+    println!("Getting active audio streams...");
 
-    // Try PipeWire first (pw-cli)
+    // Get all active PipeWire audio output streams
     let output = Command::new("pw-cli")
         .args(["list-objects"])
         .output();
 
-    let mut applications = Vec::new();
+    let mut streams = Vec::new();
 
     match output {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut current_node_name: Option<String> = None;
+            let mut current_app_name: Option<String> = None;
+            let mut current_media_name: Option<String> = None;
+            let mut is_output_stream = false;
+            let mut in_node = false;
 
             for line in stdout.lines() {
                 let line = line.trim();
 
-                // Look for application.name in PipeWire node properties
-                if line.contains("application.name =") {
-                    if let Some(name_part) = line.split("application.name = ").nth(1) {
-                        let app_name = name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string();
-                        if !app_name.is_empty() && !applications.contains(&app_name) {
-                            applications.push(app_name);
+                // Detect node start
+                if line.contains("type PipeWire:Interface:Node") {
+                    // Check if previous node was an output stream
+                    if in_node && is_output_stream {
+                        if let Some(node_name) = &current_node_name {
+                            // Create a display name from app name and media name
+                            let display_name = match (&current_app_name, &current_media_name) {
+                                (Some(app), Some(media)) => format!("{}: {}", app, media),
+                                (Some(app), None) => app.clone(),
+                                (None, Some(media)) => media.clone(),
+                                (None, None) => node_name.clone(),
+                            };
+
+                            streams.push((display_name, node_name.clone()));
+                        }
+                    }
+
+                    // Reset for new node
+                    current_node_name = None;
+                    current_app_name = None;
+                    current_media_name = None;
+                    is_output_stream = false;
+                    in_node = true;
+                } else if in_node {
+                    // Check if this is an output stream
+                    if line.contains("media.class =") && line.contains("Stream/Output/Audio") {
+                        is_output_stream = true;
+                    }
+
+                    // Extract node.name
+                    if line.contains("node.name =") {
+                        if let Some(name_part) = line.split("node.name = ").nth(1) {
+                            current_node_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+                        }
+                    }
+
+                    // Extract application.name
+                    if line.contains("application.name =") {
+                        if let Some(name_part) = line.split("application.name = ").nth(1) {
+                            current_app_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+                        }
+                    }
+
+                    // Extract media.name
+                    if line.contains("media.name =") {
+                        if let Some(name_part) = line.split("media.name = ").nth(1) {
+                            current_media_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
                         }
                     }
                 }
+            }
 
-                // Also check media.name as fallback
-                if line.contains("media.name =") && applications.is_empty() {
-                    if let Some(name_part) = line.split("media.name = ").nth(1) {
-                        let media_name = name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string();
-                        if !media_name.is_empty() && !applications.contains(&media_name) {
-                            applications.push(media_name);
-                        }
-                    }
+            // Check last node
+            if in_node && is_output_stream {
+                if let Some(node_name) = current_node_name {
+                    let display_name = match (current_app_name, current_media_name) {
+                        (Some(app), Some(media)) => format!("{}: {}", app, media),
+                        (Some(app), None) => app,
+                        (None, Some(media)) => media,
+                        (None, None) => node_name.clone(),
+                    };
+
+                    streams.push((display_name, node_name));
                 }
             }
         }
-        Err(_) => {
-            // Fallback to pactl if pw-cli is not available
-            println!("pw-cli not available, falling back to pactl...");
-            if let Ok(output) = Command::new("pactl").args(["list", "sink-inputs"]).output() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut current_app: Option<String> = None;
-
-                for line in stdout.lines() {
-                    let line = line.trim();
-
-                    if line.starts_with("Sink Input #") {
-                        if let Some(app) = current_app.take() {
-                            if !applications.contains(&app) {
-                                applications.push(app);
-                            }
-                        }
-                    }
-
-                    if line.starts_with("application.name = ") {
-                        current_app = line.split(" = ")
-                            .nth(1)
-                            .map(|s| s.trim_matches('"').to_string());
-                    }
-
-                    if line.starts_with("media.name = ") && current_app.is_none() {
-                        current_app = line.split(" = ")
-                            .nth(1)
-                            .map(|s| s.trim_matches('"').to_string());
-                    }
-                }
-
-                if let Some(app) = current_app {
-                    if !applications.contains(&app) {
-                        applications.push(app);
-                    }
-                }
-            }
+        Err(e) => {
+            println!("Failed to get PipeWire streams: {}", e);
         }
     }
 
-    applications
+    println!("Found {} active audio stream(s)", streams.len());
+    for (display, node) in &streams {
+        println!("  - {} (node: {})", display, node);
+    }
+    streams
 }
 
-fn find_pipewire_node_by_app_name(app_name: &str) -> Option<String> {
-    println!("Looking for PipeWire node with application name: {}", app_name);
+fn find_pipewire_node_by_app_name(app_name: &str) -> Option<Vec<String>> {
+    println!("Looking for PipeWire nodes with application name: {}", app_name);
 
     let output = Command::new("pw-cli")
         .args(["list-objects"])
@@ -432,65 +446,73 @@ fn find_pipewire_node_by_app_name(app_name: &str) -> Option<String> {
         .ok()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut current_node_id: Option<String> = None;
     let mut current_node_name: Option<String> = None;
     let mut current_app_name: Option<String> = None;
     let mut is_stream = false;
+    let mut matching_nodes = Vec::new();
+    let mut in_node = false;
 
     for line in stdout.lines() {
         let line = line.trim();
 
         // Detect node start - look for "id X, type PipeWire:Interface:Node"
         if line.contains("type PipeWire:Interface:Node") {
-            // Check if previous node matches
-            if let (Some(app), Some(node_name)) = (&current_app_name, &current_node_name) {
-                if app == app_name && is_stream {
-                    println!("Found PipeWire node: {}", node_name);
-                    return Some(node_name.clone());
+            // Check if previous node matches before resetting
+            if in_node {
+                if let (Some(app), Some(node_name)) = (&current_app_name, &current_node_name) {
+                    if app == app_name && is_stream {
+                        println!("Found PipeWire node: {}", node_name);
+                        matching_nodes.push(node_name.clone());
+                    }
                 }
             }
 
-            // Extract node ID from line like "id 123, type PipeWire:Interface:Node"
-            if let Some(id_part) = line.split("id ").nth(1) {
-                if let Some(id_str) = id_part.split(',').next() {
-                    current_node_id = Some(id_str.trim().to_string());
-                }
-            }
+            // Reset for new node
             current_node_name = None;
             current_app_name = None;
             is_stream = false;
-        }
+            in_node = true;
+        } else if in_node {
+            // We're collecting properties for the current node
 
-        // Check if this is a stream (not a device)
-        if line.contains("media.class =") && line.contains("Stream/Output") {
-            is_stream = true;
-        }
-
-        // Extract node.name
-        if line.contains("node.name =") {
-            if let Some(name_part) = line.split("node.name = ").nth(1) {
-                current_node_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+            // Check if this is a stream (not a device)
+            if line.contains("media.class =") && line.contains("Stream/Output") {
+                is_stream = true;
             }
-        }
 
-        // Extract application.name
-        if line.contains("application.name =") {
-            if let Some(name_part) = line.split("application.name = ").nth(1) {
-                current_app_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+            // Extract node.name
+            if line.contains("node.name =") {
+                if let Some(name_part) = line.split("node.name = ").nth(1) {
+                    current_node_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+                }
+            }
+
+            // Extract application.name
+            if line.contains("application.name =") {
+                if let Some(name_part) = line.split("application.name = ").nth(1) {
+                    current_app_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+                }
             }
         }
     }
 
     // Check last node
-    if let (Some(app), Some(node_name)) = (current_app_name, current_node_name) {
-        if app == app_name && is_stream {
-            println!("Found PipeWire node: {}", node_name);
-            return Some(node_name);
+    if in_node {
+        if let (Some(app), Some(node_name)) = (current_app_name, current_node_name) {
+            if app == app_name && is_stream {
+                println!("Found PipeWire node: {}", node_name);
+                matching_nodes.push(node_name);
+            }
         }
     }
 
-    println!("No PipeWire node found for application: {}", app_name);
-    None
+    if matching_nodes.is_empty() {
+        println!("No PipeWire nodes found for application: {}", app_name);
+        None
+    } else {
+        println!("Found {} PipeWire node(s) for application: {}", matching_nodes.len(), app_name);
+        Some(matching_nodes)
+    }
 }
 
 fn find_sink_input_by_app_name(app_name: &str) -> Option<String> {
@@ -713,13 +735,13 @@ fn main() {
         audio_group.add(&audio_row);
 
         let app_row = ActionRow::new();
-        app_row.set_title("Running Applications");
-        app_row.set_subtitle("Select an application to record its audio");
+        app_row.set_title("Active Audio Streams");
+        app_row.set_subtitle("Select an audio stream to record");
 
         let app_list = StringList::new(&[]);
         app_list.append("None - Use device above");
-        for name in &applications {
-            app_list.append(name);
+        for (display_name, _node_name) in &applications {
+            app_list.append(display_name);
         }
         let app_dropdown = DropDown::builder()
             .model(&app_list)
@@ -1059,21 +1081,21 @@ fn main() {
                 match control_rx.recv() {
                     Ok(should_run) => {
                         if should_run {
-                            // Check if an application is selected (index > 0 means an app is selected)
+                            // Check if a stream is selected (index > 0 means a stream is selected)
                             let app_index = selected_app_index.load(Ordering::Relaxed);
                             let device_to_use = if app_index > 0 {
-                                // App selected: index 0 is "None", so app index 1 = applications[0]
-                                let app_idx = app_index - 1;
-                                if let Some(app_name) = applications.get(app_idx) {
-                                    println!("Recording from application: {}", app_name);
-                                    format!("app:{}", app_name)
+                                // Stream selected: index 0 is "None", so app index 1 = applications[0]
+                                let stream_idx = app_index - 1;
+                                if let Some((display_name, node_name)) = applications.get(stream_idx) {
+                                    println!("Recording from stream: {}", display_name);
+                                    format!("stream:{}", node_name)
                                 } else {
-                                    println!("Invalid app index, falling back to device");
+                                    println!("Invalid stream index, falling back to device");
                                     let device_index = selected_device_index.load(Ordering::Relaxed);
                                     devices.get(device_index).unwrap_or(&default_device).clone()
                                 }
                             } else {
-                                // No app selected, use device
+                                // No stream selected, use device
                                 let device_index = selected_device_index.load(Ordering::Relaxed);
                                 devices.get(device_index).unwrap_or(&default_device).clone()
                             };
