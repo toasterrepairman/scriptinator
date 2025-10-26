@@ -8,12 +8,13 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use chrono::Local;
-use std::io::{Write, Read, BufReader, BufRead};
+use std::io::{Read, BufReader, BufRead};
 use libadwaita::prelude::*;
 use libadwaita::{HeaderBar, PreferencesGroup, ActionRow, ApplicationWindow as AdwApplicationWindow};
 use std::collections::VecDeque;
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
 use hf_hub::api::sync::Api;
+
 
 // --- Runtime-configurable Settings ---
 struct AppSettings {
@@ -62,8 +63,126 @@ impl AppSettings {
     }
 }
 
+// PipeWire stream wrapper for audio capture
+// Uses pw-loopback to create a virtual null sink and routes stream audio to it
+// Then captures from the null sink's monitor - this is the most reliable method
+struct PipeWireCapture {
+    child_process: Option<std::process::Child>,
+    loopback_process: Option<std::process::Child>,
+    null_sink_name: Option<String>,
+}
+
+impl PipeWireCapture {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            child_process: None,
+            loopback_process: None,
+            null_sink_name: None,
+        })
+    }
+
+    fn start_recording_by_name(&mut self, node_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Create a unique null sink for this capture session
+        let sink_name = format!("scriptinator_capture_{}", std::process::id());
+
+        println!("Creating null sink: {}", sink_name);
+
+        // Create null sink using pactl
+        let output = Command::new("pactl")
+            .args([
+                "load-module",
+                "module-null-sink",
+                &format!("sink_name={}", sink_name),
+                "sink_properties=device.description=Scriptinator_Capture",
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            return Err("Failed to create null sink".into());
+        }
+
+        self.null_sink_name = Some(sink_name.clone());
+
+        // Create loopback from the PipeWire stream to our null sink
+        // This routes the application audio to our capture sink
+        println!("Creating loopback from {} to {}", node_name, sink_name);
+
+        let loopback = Command::new("pw-loopback")
+            .args([
+                "--capture", node_name,
+                "--playback", &sink_name,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        self.loopback_process = Some(loopback);
+
+        // Give the loopback a moment to establish
+        thread::sleep(Duration::from_millis(300));
+
+        // Now capture from the monitor of our null sink
+        let monitor_name = format!("{}.monitor", sink_name);
+        println!("Recording from monitor: {}", monitor_name);
+
+        let child = Command::new("parec")
+            .args([
+                "--format=s16le",
+                "--rate=16000",
+                "--channels=1",
+                &format!("--device={}", monitor_name),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        self.child_process = Some(child);
+        Ok(())
+    }
+
+    fn stop_recording(&mut self) {
+        // Stop capture
+        if let Some(mut process) = self.child_process.take() {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+
+        // Stop loopback
+        if let Some(mut loopback) = self.loopback_process.take() {
+            let _ = loopback.kill();
+            let _ = loopback.wait();
+        }
+
+        // Remove null sink
+        if let Some(sink_name) = self.null_sink_name.take() {
+            println!("Removing null sink: {}", sink_name);
+            let _ = Command::new("pactl")
+                .args(["unload-module", "module-null-sink"])
+                .output();
+        }
+    }
+
+    fn read_data(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(ref mut process) = self.child_process {
+            if let Some(ref mut stdout) = process.stdout {
+                return stdout.read(buffer);
+            }
+        }
+        Ok(0)
+    }
+}
+
+impl Drop for PipeWireCapture {
+    fn drop(&mut self) {
+        self.stop_recording();
+    }
+}
+
 // Audio capture state
 struct AudioCapture {
+    pipewire_capture: Option<PipeWireCapture>,
     process: Option<std::process::Child>,
     buffer: VecDeque<u8>,
     last_transcription: Instant,
@@ -76,12 +195,12 @@ struct AudioCapture {
     min_api_interval: Duration,
     max_buffer_duration: Duration,
     current_null_sink: Option<String>,
-    pipewire_loopback_modules: Vec<String>,
 }
 
 impl AudioCapture {
     fn new() -> Self {
         Self {
+            pipewire_capture: None,
             process: None,
             buffer: VecDeque::new(),
             last_transcription: Instant::now(),
@@ -94,7 +213,6 @@ impl AudioCapture {
             min_api_interval: Duration::from_secs(3),
             max_buffer_duration: Duration::from_secs(10),
             current_null_sink: None,
-            pipewire_loopback_modules: Vec::new(),
         }
     }
 
@@ -128,10 +246,6 @@ impl AudioCapture {
 
             println!("Recording from PipeWire stream: {}", node_name);
 
-            // New approach: Use pw-record to directly tap into PipeWire stream
-            // This works much better than trying to use PulseAudio loopback
-            println!("Using pw-record to capture from stream");
-
             // Find the actual node ID
             let node_id = match get_pipewire_node_id(node_name) {
                 Some(id) => {
@@ -144,47 +258,15 @@ impl AudioCapture {
                 }
             };
 
-            // Use pw-record with --target to record from the specific node
-            // Output raw PCM audio to stdout
-            let pw_record = Command::new("pw-record")
-                .args([
-                    "--target", &node_id,
-                    "--rate", "16000",
-                    "--channels", "1",
-                    "--format", "s16",
-                    "-",  // output to stdout
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()?;
+            // Use native PipeWire stream capture
+            // Pass the node name directly - pw-record handles it better
+            let mut pw_capture = PipeWireCapture::new()?;
+            pw_capture.start_recording_by_name(node_name)?;
+            self.pipewire_capture = Some(pw_capture);
 
-            let pw_record_pid = pw_record.id();
-
-            // Get stdout from pw-record to pipe into ffmpeg
-            let pw_stdout = pw_record.stdout.ok_or("Failed to get pw-record stdout")?;
-
-            // Convert raw PCM to WAV format with ffmpeg
-            let child = Command::new("ffmpeg")
-                .args([
-                    "-f", "s16le",
-                    "-ar", "16000",
-                    "-ac", "1",
-                    "-i", "pipe:0",
-                    "-f", "wav",
-                    "-acodec", "pcm_s16le",
-                    "pipe:1",
-                ])
-                .stdin(pw_stdout)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()?;
-
-            // Store pw-record PID for cleanup (we need to kill it when stopping)
-            self.pipewire_loopback_modules.push(pw_record_pid.to_string());
-
-            self.process = Some(child);
+            println!("Native PipeWire capture started successfully");
         } else {
+            // Fallback to ffmpeg for regular PulseAudio devices
             let child = Command::new("ffmpeg")
                 .args([
                     "-f", "pulse",
@@ -209,30 +291,17 @@ impl AudioCapture {
 
     fn stop_recording(&mut self) {
         self.is_recording.store(false, Ordering::Relaxed);
+
+        // Stop PipeWire capture if active
+        if let Some(mut pw_capture) = self.pipewire_capture.take() {
+            println!("Stopping PipeWire capture");
+            pw_capture.stop_recording();
+        }
+
+        // Stop ffmpeg process if active
         if let Some(mut process) = self.process.take() {
             let _ = process.kill();
             let _ = process.wait();
-        }
-
-        // Kill all pw-record processes or unload PulseAudio modules
-        for item in self.pipewire_loopback_modules.drain(..) {
-            // Check if it's a PID (all digits) or a module ID
-            if item.chars().all(|c| c.is_ascii_digit()) {
-                // Could be either a PID or a module ID, try both
-                // First try to kill as a process (for pw-record)
-                println!("Attempting to kill process {}", item);
-                let kill_result = Command::new("kill")
-                    .args([&item])
-                    .output();
-
-                // If kill fails, try unloading as a module
-                if kill_result.is_err() || !kill_result.unwrap().status.success() {
-                    println!("Attempting to unload module {}", item);
-                    let _ = Command::new("pactl")
-                        .args(["unload-module", &item])
-                        .output();
-                }
-            }
         }
 
         // Clean up the capture sink module if one was created
@@ -247,44 +316,30 @@ impl AudioCapture {
     }
 
     fn read_audio_data(&mut self) -> Option<Vec<u8>> {
-        if let Some(ref mut process) = self.process {
+        let mut temp_buffer = [0u8; 8192];
+
+        // Try reading from PipeWire capture first
+        if let Some(ref mut pw_capture) = self.pipewire_capture {
+            match pw_capture.read_data(&mut temp_buffer) {
+                Ok(n) if n > 0 => {
+                    self.buffer.extend(&temp_buffer[..n]);
+                }
+                Ok(_) => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => {
+                    self.stop_recording();
+                    return None;
+                }
+            }
+        } else if let Some(ref mut process) = self.process {
+            // Try reading from ffmpeg process if no PipeWire capture
             if let Some(ref mut stdout) = process.stdout {
                 let mut reader = BufReader::new(stdout);
-                let mut temp_buffer = [0u8; 8192];
 
                 match reader.read(&mut temp_buffer) {
-                    Ok(bytes_read) if bytes_read > 0 => {
-                        self.buffer.extend(&temp_buffer[..bytes_read]);
-
-                        if self.buffer.len() > 16000 {
-                            let recent_audio: Vec<u8> = self.buffer.iter().rev().take(16000).rev().cloned().collect();
-                            let amplitude = self.calculate_rms_amplitude(&recent_audio);
-
-                            // println!("Current amplitude: {:.6}, threshold: {:.6}, silence elapsed: {:.1}s",
-                            //     amplitude, self.silence_threshold, self.last_significant_audio.elapsed().as_secs_f32());
-
-                            if amplitude > self.silence_threshold {
-                                self.last_significant_audio = Instant::now();
-                            }
-                        }
-
-                        let min_buffer_met = self.buffer.len() > 144_000;
-                        let min_interval_met = self.last_transcription.elapsed() > Duration::from_secs(3);
-                        let silence_detected = self.buffer.len() > 288_000 &&
-                                               self.last_significant_audio.elapsed() > self.silence_duration;
-                        let timeout_triggered = self.buffer_start_time.elapsed() >= self.max_buffer_duration;
-
-                        let should_process = min_buffer_met &&
-                            (min_interval_met || silence_detected || timeout_triggered);
-
-                        if should_process {
-                            println!("Processing audio: buffer_size={}, min_interval={}, silence={}, timeout={}",
-                                self.buffer.len(), min_interval_met, silence_detected, timeout_triggered);
-                            let audio_data: Vec<u8> = self.buffer.drain(..).collect();
-                            self.last_transcription = Instant::now();
-                            self.buffer_start_time = Instant::now();
-                            return Some(audio_data);
-                        }
+                    Ok(n) if n > 0 => {
+                        self.buffer.extend(&temp_buffer[..n]);
                     }
                     Ok(_) => {
                         thread::sleep(Duration::from_millis(100));
@@ -296,6 +351,38 @@ impl AudioCapture {
                 }
             }
         }
+
+        // Process buffer if we have data
+        if self.buffer.len() > 16000 {
+            let recent_audio: Vec<u8> = self.buffer.iter().rev().take(16000).rev().cloned().collect();
+            let amplitude = self.calculate_rms_amplitude(&recent_audio);
+
+            // println!("Current amplitude: {:.6}, threshold: {:.6}, silence elapsed: {:.1}s",
+            //     amplitude, self.silence_threshold, self.last_significant_audio.elapsed().as_secs_f32());
+
+            if amplitude > self.silence_threshold {
+                self.last_significant_audio = Instant::now();
+            }
+        }
+
+        let min_buffer_met = self.buffer.len() > 144_000;
+        let min_interval_met = self.last_transcription.elapsed() > Duration::from_secs(3);
+        let silence_detected = self.buffer.len() > 288_000 &&
+                               self.last_significant_audio.elapsed() > self.silence_duration;
+        let timeout_triggered = self.buffer_start_time.elapsed() >= self.max_buffer_duration;
+
+        let should_process = min_buffer_met &&
+            (min_interval_met || silence_detected || timeout_triggered);
+
+        if should_process {
+            println!("Processing audio: buffer_size={}, min_interval={}, silence={}, timeout={}",
+                self.buffer.len(), min_interval_met, silence_detected, timeout_triggered);
+            let audio_data: Vec<u8> = self.buffer.drain(..).collect();
+            self.last_transcription = Instant::now();
+            self.buffer_start_time = Instant::now();
+            return Some(audio_data);
+        }
+
         None
     }
 }

@@ -51,6 +51,7 @@
         stdenv.cc.cc.lib   # stdc++ linking
         llvmPackages.libclang
         openblas
+        pipewire.dev
         #
         # cudaPackages.cuda_nvcc
         # cudaPackages.cuda_cudart
