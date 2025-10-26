@@ -128,67 +128,60 @@ impl AudioCapture {
 
             println!("Recording from PipeWire stream: {}", node_name);
 
-            // Create a null sink to capture the audio
-            let capture_sink = "scriptinator_capture";
+            // New approach: Use pw-record to directly tap into PipeWire stream
+            // This works much better than trying to use PulseAudio loopback
+            println!("Using pw-record to capture from stream");
 
-            println!("Creating capture sink...");
-            let module_result = Command::new("pactl")
+            // Find the actual node ID
+            let node_id = match get_pipewire_node_id(node_name) {
+                Some(id) => {
+                    println!("Found PipeWire node ID: {}", id);
+                    id
+                }
+                None => {
+                    eprintln!("Could not find PipeWire node ID for: {}", node_name);
+                    return Err(format!("Node not found: {}", node_name).into());
+                }
+            };
+
+            // Use pw-record with --target to record from the specific node
+            // Output raw PCM audio to stdout
+            let pw_record = Command::new("pw-record")
                 .args([
-                    "load-module",
-                    "module-null-sink",
-                    &format!("sink_name={}", capture_sink),
-                    "sink_properties=device.description='Scriptinator_Capture'",
-                ])
-                .output()?;
-
-            if !module_result.status.success() {
-                eprintln!("Failed to create capture sink: {}", String::from_utf8_lossy(&module_result.stderr));
-                return Err("Failed to create capture sink".into());
-            }
-
-            let module_id = String::from_utf8_lossy(&module_result.stdout).trim().to_string();
-            self.current_null_sink = Some(module_id.clone());
-
-            // Give PipeWire a moment to create the sink
-            thread::sleep(Duration::from_millis(300));
-
-            // Create a loopback from the stream to our capture sink
-            println!("Creating loopback from {} to {}", node_name, capture_sink);
-
-            let loopback_result = Command::new("pw-loopback")
-                .args([
-                    "--capture", node_name,
-                    "--playback", capture_sink,
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?;
-
-            // Store the loopback process PID for cleanup
-            self.pipewire_loopback_modules.push(loopback_result.id().to_string());
-
-            // Give the loopback time to connect
-            thread::sleep(Duration::from_millis(500));
-
-            // Record from the monitor of our capture sink
-            let monitor_name = format!("{}.monitor", capture_sink);
-            println!("Recording from monitor: {}", monitor_name);
-
-            let child = Command::new("ffmpeg")
-                .args([
-                    "-f", "pulse",
-                    "-i", &monitor_name,
-                    "-f", "wav",
-                    "-ar", "16000",
-                    "-ac", "1",
-                    "-acodec", "pcm_s16le",
-                    "pipe:1",
+                    "--target", &node_id,
+                    "--rate", "16000",
+                    "--channels", "1",
+                    "--format", "s16",
+                    "-",  // output to stdout
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()?;
+
+            let pw_record_pid = pw_record.id();
+
+            // Get stdout from pw-record to pipe into ffmpeg
+            let pw_stdout = pw_record.stdout.ok_or("Failed to get pw-record stdout")?;
+
+            // Convert raw PCM to WAV format with ffmpeg
+            let child = Command::new("ffmpeg")
+                .args([
+                    "-f", "s16le",
+                    "-ar", "16000",
+                    "-ac", "1",
+                    "-i", "pipe:0",
+                    "-f", "wav",
+                    "-acodec", "pcm_s16le",
+                    "pipe:1",
+                ])
+                .stdin(pw_stdout)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?;
+
+            // Store pw-record PID for cleanup (we need to kill it when stopping)
+            self.pipewire_loopback_modules.push(pw_record_pid.to_string());
 
             self.process = Some(child);
         } else {
@@ -221,17 +214,30 @@ impl AudioCapture {
             let _ = process.wait();
         }
 
-        // Kill ALL pw-loopback processes that were created
-        for pid in self.pipewire_loopback_modules.drain(..) {
-            println!("Killing pw-loopback process {}", pid);
-            let _ = Command::new("kill")
-                .args([&pid])
-                .output();
+        // Kill all pw-record processes or unload PulseAudio modules
+        for item in self.pipewire_loopback_modules.drain(..) {
+            // Check if it's a PID (all digits) or a module ID
+            if item.chars().all(|c| c.is_ascii_digit()) {
+                // Could be either a PID or a module ID, try both
+                // First try to kill as a process (for pw-record)
+                println!("Attempting to kill process {}", item);
+                let kill_result = Command::new("kill")
+                    .args([&item])
+                    .output();
+
+                // If kill fails, try unloading as a module
+                if kill_result.is_err() || !kill_result.unwrap().status.success() {
+                    println!("Attempting to unload module {}", item);
+                    let _ = Command::new("pactl")
+                        .args(["unload-module", &item])
+                        .output();
+                }
+            }
         }
 
         // Clean up the capture sink module if one was created
         if let Some(module_id) = self.current_null_sink.take() {
-            println!("Unloading module {}", module_id);
+            println!("Unloading null sink module {}", module_id);
             let _ = Command::new("pactl")
                 .args(["unload-module", &module_id])
                 .output();
@@ -340,9 +346,8 @@ fn get_audio_devices() -> Vec<String> {
 fn get_running_applications() -> Vec<(String, String)> {
     println!("Getting active audio streams...");
 
-    // Get all active PipeWire audio output streams
-    let output = Command::new("pw-cli")
-        .args(["list-objects"])
+    // Use pw-dump for more reliable JSON output
+    let output = Command::new("pw-dump")
         .output();
 
     let mut streams = Vec::new();
@@ -350,78 +355,110 @@ fn get_running_applications() -> Vec<(String, String)> {
     match output {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
+
+            // Parse as JSON manually since we don't want to add serde dependency
+            // We'll look for nodes with specific characteristics:
+            // 1. media.class = "Stream/Output/Audio" (application audio output)
+            // 2. node.name exists
+            // 3. Has an active port connection (state = "running" or has ports)
+
+            let mut current_object: Option<String> = None;
             let mut current_node_name: Option<String> = None;
             let mut current_app_name: Option<String> = None;
             let mut current_media_name: Option<String> = None;
-            let mut is_output_stream = false;
-            let mut in_node = false;
+            let mut current_media_class: Option<String> = None;
+            let mut current_state: Option<String> = None;
+            let mut in_info = false;
+            let mut in_props = false;
 
             for line in stdout.lines() {
                 let line = line.trim();
 
-                // Detect node start
-                if line.contains("type PipeWire:Interface:Node") {
-                    // Check if previous node was an output stream
-                    if in_node && is_output_stream {
-                        if let Some(node_name) = &current_node_name {
-                            // Create a display name from app name and media name
-                            let display_name = match (&current_app_name, &current_media_name) {
-                                (Some(app), Some(media)) => format!("{}: {}", app, media),
-                                (Some(app), None) => app.clone(),
-                                (None, Some(media)) => media.clone(),
-                                (None, None) => node_name.clone(),
-                            };
+                // Detect new object start
+                if line.starts_with("{") && !in_info && !in_props {
+                    // Save previous object if it was a valid stream
+                    if let (Some(node_name), Some(media_class)) = (&current_node_name, &current_media_class) {
+                        if media_class == "Stream/Output/Audio" {
+                            // Only include streams that are running or have state information
+                            let is_active = current_state.as_ref().map(|s| s == "running").unwrap_or(true);
 
-                            streams.push((display_name, node_name.clone()));
+                            if is_active {
+                                let display_name = match (&current_app_name, &current_media_name) {
+                                    (Some(app), Some(media)) => format!("{}: {}", app, media),
+                                    (Some(app), None) => app.clone(),
+                                    (None, Some(media)) => media.clone(),
+                                    (None, None) => node_name.clone(),
+                                };
+
+                                streams.push((display_name, node_name.clone()));
+                            }
                         }
                     }
 
-                    // Reset for new node
+                    // Reset for new object
+                    current_object = Some(String::new());
                     current_node_name = None;
                     current_app_name = None;
                     current_media_name = None;
-                    is_output_stream = false;
-                    in_node = true;
-                } else if in_node {
-                    // Check if this is an output stream
-                    if line.contains("media.class =") && line.contains("Stream/Output/Audio") {
-                        is_output_stream = true;
-                    }
+                    current_media_class = None;
+                    current_state = None;
+                    in_info = false;
+                    in_props = false;
+                }
 
-                    // Extract node.name
-                    if line.contains("node.name =") {
-                        if let Some(name_part) = line.split("node.name = ").nth(1) {
-                            current_node_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+                if line.contains("\"info\":") {
+                    in_info = true;
+                } else if line.contains("\"props\":") {
+                    in_props = true;
+                } else if line == "}" || line == "}," {
+                    if in_props {
+                        in_props = false;
+                    } else if in_info {
+                        in_info = false;
+                    }
+                }
+
+                // Extract fields from props section
+                if in_props {
+                    if line.contains("\"node.name\":") {
+                        if let Some(value) = extract_json_string_value(line) {
+                            current_node_name = Some(value);
                         }
-                    }
-
-                    // Extract application.name
-                    if line.contains("application.name =") {
-                        if let Some(name_part) = line.split("application.name = ").nth(1) {
-                            current_app_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+                    } else if line.contains("\"application.name\":") {
+                        if let Some(value) = extract_json_string_value(line) {
+                            current_app_name = Some(value);
                         }
-                    }
-
-                    // Extract media.name
-                    if line.contains("media.name =") {
-                        if let Some(name_part) = line.split("media.name = ").nth(1) {
-                            current_media_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+                    } else if line.contains("\"media.name\":") {
+                        if let Some(value) = extract_json_string_value(line) {
+                            current_media_name = Some(value);
+                        }
+                    } else if line.contains("\"media.class\":") {
+                        if let Some(value) = extract_json_string_value(line) {
+                            current_media_class = Some(value);
+                        }
+                    } else if line.contains("\"node.state\":") {
+                        if let Some(value) = extract_json_string_value(line) {
+                            current_state = Some(value);
                         }
                     }
                 }
             }
 
-            // Check last node
-            if in_node && is_output_stream {
-                if let Some(node_name) = current_node_name {
-                    let display_name = match (current_app_name, current_media_name) {
-                        (Some(app), Some(media)) => format!("{}: {}", app, media),
-                        (Some(app), None) => app,
-                        (None, Some(media)) => media,
-                        (None, None) => node_name.clone(),
-                    };
+            // Check last object
+            if let (Some(node_name), Some(media_class)) = (current_node_name, current_media_class) {
+                if media_class == "Stream/Output/Audio" {
+                    let is_active = current_state.as_ref().map(|s| s == "running").unwrap_or(true);
 
-                    streams.push((display_name, node_name));
+                    if is_active {
+                        let display_name = match (current_app_name, current_media_name) {
+                            (Some(app), Some(media)) => format!("{}: {}", app, media),
+                            (Some(app), None) => app,
+                            (None, Some(media)) => media,
+                            (None, None) => node_name.clone(),
+                        };
+
+                        streams.push((display_name, node_name));
+                    }
                 }
             }
         }
@@ -435,6 +472,103 @@ fn get_running_applications() -> Vec<(String, String)> {
         println!("  - {} (node: {})", display, node);
     }
     streams
+}
+
+// Helper function to extract string value from JSON line
+fn extract_json_string_value(line: &str) -> Option<String> {
+    // Find the value after the colon
+    if let Some(colon_pos) = line.find(':') {
+        let value_part = &line[colon_pos + 1..];
+        // Find the first quote
+        if let Some(start_quote) = value_part.find('"') {
+            let after_start = &value_part[start_quote + 1..];
+            // Find the closing quote
+            if let Some(end_quote) = after_start.find('"') {
+                return Some(after_start[..end_quote].to_string());
+            }
+        }
+    }
+    None
+}
+
+// Get the PipeWire node ID from the node name
+fn get_pipewire_node_id(node_name: &str) -> Option<String> {
+    println!("Looking up PipeWire node ID for: {}", node_name);
+
+    let output = Command::new("pw-dump")
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut current_id: Option<String> = None;
+    let mut current_node_name: Option<String> = None;
+    let mut in_info = false;
+    let mut in_props = false;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+
+        // Look for object ID at the start of each object
+        if line.starts_with("\"id\":") {
+            if let Some(value) = extract_json_string_value(line) {
+                current_id = Some(value);
+            } else {
+                // Try to extract number directly
+                if let Some(colon_pos) = line.find(':') {
+                    let value_part = line[colon_pos + 1..].trim().trim_end_matches(',');
+                    current_id = Some(value_part.to_string());
+                }
+            }
+        }
+
+        // Detect new object
+        if line.starts_with("{") && !in_info && !in_props {
+            // Check if previous object matches
+            if let (Some(id), Some(name)) = (&current_id, &current_node_name) {
+                if name == node_name {
+                    println!("Found node ID {} for {}", id, node_name);
+                    return Some(id.clone());
+                }
+            }
+
+            // Reset for new object
+            current_id = None;
+            current_node_name = None;
+            in_info = false;
+            in_props = false;
+        }
+
+        if line.contains("\"info\":") {
+            in_info = true;
+        } else if line.contains("\"props\":") {
+            in_props = true;
+        } else if line == "}" || line == "}," {
+            if in_props {
+                in_props = false;
+            } else if in_info {
+                in_info = false;
+            }
+        }
+
+        // Extract node.name from props
+        if in_props && line.contains("\"node.name\":") {
+            if let Some(value) = extract_json_string_value(line) {
+                current_node_name = Some(value);
+            }
+        }
+    }
+
+    // Check last object
+    if let (Some(id), Some(name)) = (current_id, current_node_name) {
+        if name == node_name {
+            println!("Found node ID {} for {}", id, node_name);
+            return Some(id);
+        }
+    }
+
+    println!("Could not find node ID for: {}", node_name);
+    None
 }
 
 fn find_pipewire_node_by_app_name(app_name: &str) -> Option<Vec<String>> {

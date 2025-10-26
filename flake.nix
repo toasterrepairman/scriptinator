@@ -50,6 +50,7 @@
         clang
         stdenv.cc.cc.lib   # stdc++ linking
         llvmPackages.libclang
+        openblas
         #
         # cudaPackages.cuda_nvcc
         # cudaPackages.cuda_cudart
@@ -78,6 +79,7 @@
         nativeBuildInputs = packageDeps;
         buildInputs = packageDeps;
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        BLAS_INCLUDE_DIRS = "${pkgs.openblas.dev}/include";
 
         cargoLock.lockFile = ./Cargo.lock;
 
@@ -108,7 +110,8 @@
             export GST_PLUGIN_SYSTEM_PATH_1_0=$GST_PLUGIN_SYSTEM_PATH_1_0:${pkgs.gst_all_1.gst-plugins-bad}/lib/gstreamer-1.0
             export GST_PLUGIN_SYSTEM_PATH_1_0=$GST_PLUGIN_SYSTEM_PATH_1_0:${pkgs.gst_all_1.gst-plugins-ugly}/lib/gstreamer-1.0
             export GST_PLUGIN_SYSTEM_PATH_1_0=$GST_PLUGIN_SYSTEM_PATH_1_0:${pkgs.gst_all_1.gst-libav}/lib/gstreamer-1.0
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+            export BLAS_INCLUDE_DIRS="${pkgs.openblas.dev}/include"
 
             # Set GStreamer debug level (optional)
             # export GST_DEBUG=3,GstPipeline:4,GstMemory:5,GstPoll:5 RUST_BACKTRACE=1 admiral
@@ -118,6 +121,7 @@
         # CUDA_ROOT = "${pkgs.cudaPackages.cudatoolkit}";
         buildInputs = [(rustVersion.override {extensions = ["rust-src"];})];
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        BLAS_INCLUDE_DIRS = "${pkgs.openblas.dev}/include";
       };
 
       meta = with nixpkgs.lib; {
