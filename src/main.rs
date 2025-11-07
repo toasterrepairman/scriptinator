@@ -896,7 +896,6 @@ fn main() {
         let settings = Arc::new(AppSettings::new());
         let devices = get_audio_devices();
         let default_source = get_default_source();
-        let applications = get_running_applications();
         let main_vbox = GtkBox::new(Orientation::Vertical, 0);
 
         let title_label = Label::builder()
@@ -910,7 +909,7 @@ fn main() {
             .build();
 
         let start_stop_button = Button::builder()
-            .label("Start Recording")
+            .label("Record")
             .build();
         header_bar.pack_start(&start_stop_button);
 
@@ -948,24 +947,6 @@ fn main() {
 
         audio_row.add_suffix(&device_dropdown);
         audio_group.add(&audio_row);
-
-        let app_row = ActionRow::new();
-        app_row.set_title("Active Audio Streams");
-        app_row.set_subtitle("Select an audio stream to record");
-
-        let app_list = StringList::new(&[]);
-        app_list.append("None - Use device above");
-        for (display_name, _node_name) in &applications {
-            app_list.append(display_name);
-        }
-        let app_dropdown = DropDown::builder()
-            .model(&app_list)
-            .selected(0)
-            .valign(Align::Center)
-            .build();
-
-        app_row.add_suffix(&app_dropdown);
-        audio_group.add(&app_row);
 
         settings_box.append(&audio_group);
 
@@ -1082,27 +1063,34 @@ fn main() {
         // Create welcome screen
         let welcome_box = GtkBox::new(Orientation::Vertical, 12);
         welcome_box.set_valign(Align::Center);
-        welcome_box.set_halign(Align::Center);
-        welcome_box.set_margin_top(48);
-        welcome_box.set_margin_bottom(48);
-        welcome_box.set_margin_start(48);
-        welcome_box.set_margin_end(48);
+        welcome_box.set_halign(Align::Fill);
+        welcome_box.set_margin_top(24);
+        welcome_box.set_margin_bottom(24);
+        welcome_box.set_margin_start(24);
+        welcome_box.set_margin_end(24);
 
         let welcome_title = Label::builder()
             .label("Scriptinator")
             .css_classes(vec!["title-1"])
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::Word)
+            .justify(gtk::Justification::Center)
             .build();
         welcome_box.append(&welcome_title);
 
         let welcome_subtitle = Label::builder()
             .label("Real-time audio transcription with Whisper")
             .css_classes(vec!["title-2"])
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::Word)
+            .justify(gtk::Justification::Center)
             .build();
         welcome_box.append(&welcome_subtitle);
 
         let welcome_description = Label::builder()
-            .label("To get started, download the Whisper model from settings (one-time setup) and click 'Start Recording' to begin transcription.")
+            .label("To get started, download the Whisper model from settings (one-time setup) and click 'Record' to begin transcription.")
             .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::Word)
             .justify(gtk::Justification::Center)
             .css_classes(vec!["body"])
             .build();
@@ -1251,16 +1239,10 @@ fn main() {
         });
 
         let selected_device_index = Arc::new(AtomicUsize::new(default_index as usize));
-        let selected_app_index = Arc::new(AtomicUsize::new(0));
 
         let selected_device_index_clone = selected_device_index.clone();
         device_dropdown.connect_selected_notify(move |dropdown| {
             selected_device_index_clone.store(dropdown.selected() as usize, Ordering::Relaxed);
-        });
-
-        let selected_app_index_clone = selected_app_index.clone();
-        app_dropdown.connect_selected_notify(move |dropdown| {
-            selected_app_index_clone.store(dropdown.selected() as usize, Ordering::Relaxed);
         });
 
         let (control_tx, control_rx) = mpsc::channel::<bool>();
@@ -1272,11 +1254,11 @@ fn main() {
         start_stop_button.connect_clicked(move |button| {
             let is_running = running_clone_for_button.load(Ordering::Relaxed);
             if is_running {
-                button.set_label("Start Recording");
+                button.set_label("Record");
                 running_clone_for_button.store(false, Ordering::Relaxed);
                 let _ = control_tx_clone.send(false);
             } else {
-                button.set_label("Stop Recording");
+                button.set_label("Pause");
                 running_clone_for_button.store(true, Ordering::Relaxed);
                 let _ = control_tx_clone.send(true);
 
@@ -1296,24 +1278,9 @@ fn main() {
                 match control_rx.recv() {
                     Ok(should_run) => {
                         if should_run {
-                            // Check if a stream is selected (index > 0 means a stream is selected)
-                            let app_index = selected_app_index.load(Ordering::Relaxed);
-                            let device_to_use = if app_index > 0 {
-                                // Stream selected: index 0 is "None", so app index 1 = applications[0]
-                                let stream_idx = app_index - 1;
-                                if let Some((display_name, node_name)) = applications.get(stream_idx) {
-                                    println!("Recording from stream: {}", display_name);
-                                    format!("stream:{}", node_name)
-                                } else {
-                                    println!("Invalid stream index, falling back to device");
-                                    let device_index = selected_device_index.load(Ordering::Relaxed);
-                                    devices.get(device_index).unwrap_or(&default_device).clone()
-                                }
-                            } else {
-                                // No stream selected, use device
-                                let device_index = selected_device_index.load(Ordering::Relaxed);
-                                devices.get(device_index).unwrap_or(&default_device).clone()
-                            };
+                            // Use the selected audio device
+                            let device_index = selected_device_index.load(Ordering::Relaxed);
+                            let device_to_use = devices.get(device_index).unwrap_or(&default_device).clone();
 
                             if let Err(e) = audio_capture.start_recording(&device_to_use) {
                                 println!("Failed to start recording: {}", e);
