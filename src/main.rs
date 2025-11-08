@@ -14,6 +14,7 @@ use libadwaita::{HeaderBar, PreferencesGroup, ActionRow, ApplicationWindow as Ad
 use std::collections::VecDeque;
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
 use hf_hub::api::sync::Api;
+use voice_activity_detector::VoiceActivityDetector;
 
 
 // --- Runtime-configurable Settings ---
@@ -179,53 +180,90 @@ struct AudioCapture {
     pipewire_capture: Option<PipeWireCapture>,
     process: Option<std::process::Child>,
     buffer: VecDeque<u8>,
+    overlap_buffer: Vec<u8>,
     last_transcription: Instant,
-    last_significant_audio: Instant,
+    last_speech_detected: Instant,
+    last_silence_detected: Instant,
     last_api_call: Instant,
     buffer_start_time: Instant,
     is_recording: AtomicBool,
-    silence_threshold: f32,
+    vad: VoiceActivityDetector,
+    vad_threshold: f32,
+    speech_duration_threshold: Duration,
     silence_duration: Duration,
     min_api_interval: Duration,
     max_buffer_duration: Duration,
+    overlap_duration_samples: usize,
     current_null_sink: Option<String>,
+    speech_detected: bool,
 }
 
 impl AudioCapture {
     fn new() -> Self {
+        // Initialize VAD with 16kHz sample rate, 512-sample chunks
+        // For 16kHz, Silero VAD V5 only supports 512-sample windows
+        let vad = VoiceActivityDetector::builder()
+            .sample_rate(16000)
+            .chunk_size(512usize)
+            .build()
+            .expect("Failed to initialize VAD");
+
+        // 1.5 seconds of overlap at 16kHz, 16-bit mono = 16000 * 1.5 * 2 = 48000 bytes
+        let overlap_duration_samples = 48_000;
+
         Self {
             pipewire_capture: None,
             process: None,
             buffer: VecDeque::new(),
+            overlap_buffer: Vec::new(),
             last_transcription: Instant::now(),
-            last_significant_audio: Instant::now(),
+            last_speech_detected: Instant::now(),
+            last_silence_detected: Instant::now(),
             last_api_call: Instant::now(),
             buffer_start_time: Instant::now(),
             is_recording: AtomicBool::new(false),
-            silence_threshold: 0.01,
+            vad,
+            vad_threshold: 0.5, // 50% probability threshold for speech detection
+            speech_duration_threshold: Duration::from_millis(500), // Require 500ms of speech before considering it active
             silence_duration: Duration::from_secs(2),
             min_api_interval: Duration::from_secs(3),
-            max_buffer_duration: Duration::from_secs(10),
+            max_buffer_duration: Duration::from_secs(15), // Increased to 15 seconds
+            overlap_duration_samples,
             current_null_sink: None,
+            speech_detected: false,
         }
     }
 
-    fn calculate_rms_amplitude(&self, audio_data: &[u8]) -> f32 {
+    fn detect_speech_with_vad(&mut self, audio_data: &[u8]) -> f32 {
         if audio_data.len() < 2 {
             return 0.0;
         }
 
-        let mut sum_squares = 0i64;
-        let sample_count = audio_data.len() / 2;
-
+        // Convert bytes to i16 samples for VAD
+        let mut samples = Vec::new();
         for chunk in audio_data.chunks_exact(2) {
-            let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
-            sum_squares += (sample * sample) as i64;
+            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+            samples.push(sample);
         }
 
-        let mean_square = sum_squares as f64 / sample_count as f64;
-        let rms = mean_square.sqrt();
-        (rms / 32768.0) as f32
+        // VAD requires exactly 512 samples for 16kHz
+        // Process in 512-sample chunks and average the probabilities
+        let mut total_probability = 0.0;
+        let mut chunk_count = 0;
+
+        for chunk in samples.chunks(512) {
+            if chunk.len() == 512 {
+                let probability = self.vad.predict(chunk.to_vec());
+                total_probability += probability;
+                chunk_count += 1;
+            }
+        }
+
+        if chunk_count > 0 {
+            total_probability / chunk_count as f32
+        } else {
+            0.0
+        }
     }
 
     fn start_recording(&mut self, device: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -346,34 +384,64 @@ impl AudioCapture {
             }
         }
 
-        // Process buffer if we have data
-        if self.buffer.len() > 16000 {
-            let recent_audio: Vec<u8> = self.buffer.iter().rev().take(16000).rev().cloned().collect();
-            let amplitude = self.calculate_rms_amplitude(&recent_audio);
+        // Use VAD to detect speech/silence if we have enough data
+        // Process recent 1 second of audio (16kHz * 2 bytes = 32000 bytes)
+        if self.buffer.len() > 32_000 {
+            let recent_audio: Vec<u8> = self.buffer.iter().rev().take(32_000).rev().cloned().collect();
+            let speech_probability = self.detect_speech_with_vad(&recent_audio);
 
-            // println!("Current amplitude: {:.6}, threshold: {:.6}, silence elapsed: {:.1}s",
-            //     amplitude, self.silence_threshold, self.last_significant_audio.elapsed().as_secs_f32());
-
-            if amplitude > self.silence_threshold {
-                self.last_significant_audio = Instant::now();
+            // Track speech and silence transitions
+            if speech_probability > self.vad_threshold {
+                if !self.speech_detected {
+                    println!("Speech started (probability: {:.2})", speech_probability);
+                    self.speech_detected = true;
+                }
+                self.last_speech_detected = Instant::now();
+            } else {
+                if self.speech_detected && self.last_speech_detected.elapsed() > self.silence_duration {
+                    println!("Silence detected (probability: {:.2})", speech_probability);
+                    self.last_silence_detected = Instant::now();
+                }
             }
         }
 
-        let min_buffer_met = self.buffer.len() > 144_000;
-        let min_interval_met = self.last_transcription.elapsed() > Duration::from_secs(3);
-        let silence_detected = self.buffer.len() > 288_000 &&
-                               self.last_significant_audio.elapsed() > self.silence_duration;
+        // Determine if we should process the buffer
+        let min_buffer_met = self.buffer.len() > 96_000; // ~6 seconds minimum
+        let speech_then_silence = self.speech_detected &&
+                                   self.last_speech_detected.elapsed() > self.silence_duration;
         let timeout_triggered = self.buffer_start_time.elapsed() >= self.max_buffer_duration;
 
-        let should_process = min_buffer_met &&
-            (min_interval_met || silence_detected || timeout_triggered);
+        let should_process = min_buffer_met && (speech_then_silence || timeout_triggered);
 
         if should_process {
-            println!("Processing audio: buffer_size={}, min_interval={}, silence={}, timeout={}",
-                self.buffer.len(), min_interval_met, silence_detected, timeout_triggered);
-            let audio_data: Vec<u8> = self.buffer.drain(..).collect();
+            println!("Processing audio: buffer_size={}, speech_detected={}, speech_then_silence={}, timeout={}",
+                self.buffer.len(), self.speech_detected, speech_then_silence, timeout_triggered);
+
+            // Prepare audio data with overlap from previous chunk
+            let mut audio_data = Vec::new();
+
+            // Add overlap from previous transcription (if available)
+            if !self.overlap_buffer.is_empty() {
+                println!("Adding {} bytes of overlap from previous chunk", self.overlap_buffer.len());
+                audio_data.extend_from_slice(&self.overlap_buffer);
+            }
+
+            // Add current buffer
+            let current_buffer: Vec<u8> = self.buffer.drain(..).collect();
+            audio_data.extend_from_slice(&current_buffer);
+
+            // Save the last 1.5 seconds for next overlap
+            if audio_data.len() > self.overlap_duration_samples {
+                let overlap_start = audio_data.len() - self.overlap_duration_samples;
+                self.overlap_buffer = audio_data[overlap_start..].to_vec();
+            } else {
+                self.overlap_buffer = audio_data.clone();
+            }
+
             self.last_transcription = Instant::now();
             self.buffer_start_time = Instant::now();
+            self.speech_detected = false; // Reset for next cycle
+
             return Some(audio_data);
         }
 

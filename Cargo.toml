@@ -25,3 +25,4 @@ tempfile = "3.20.0"
 base64 = "0.22.1"
 whisper-rs = { version = "0.15.1", default-features = false }
 hf-hub = "0.4.3"
+voice_activity_detector = "0.2.1"
