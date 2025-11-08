@@ -52,6 +52,7 @@
         llvmPackages.libclang
         openblas
         pipewire.dev
+        onnxruntime  # For voice_activity_detector
         #
         # cudaPackages.cuda_nvcc
         # cudaPackages.cuda_cudart
@@ -81,6 +82,8 @@
         buildInputs = packageDeps;
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         BLAS_INCLUDE_DIRS = "${pkgs.openblas.dev}/include";
+        ORT_LIB_LOCATION = "${pkgs.onnxruntime}";
+        ORT_STRATEGY = "system";
 
         cargoLock.lockFile = ./Cargo.lock;
 
@@ -113,6 +116,8 @@
             export GST_PLUGIN_SYSTEM_PATH_1_0=$GST_PLUGIN_SYSTEM_PATH_1_0:${pkgs.gst_all_1.gst-libav}/lib/gstreamer-1.0
             export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
             export BLAS_INCLUDE_DIRS="${pkgs.openblas.dev}/include"
+            export ORT_LIB_LOCATION="${pkgs.onnxruntime}"
+            export ORT_STRATEGY="system"
 
             # Set GStreamer debug level (optional)
             # export GST_DEBUG=3,GstPipeline:4,GstMemory:5,GstPoll:5 RUST_BACKTRACE=1 admiral
@@ -123,6 +128,8 @@
         buildInputs = [(rustVersion.override {extensions = ["rust-src"];})];
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         BLAS_INCLUDE_DIRS = "${pkgs.openblas.dev}/include";
+        ORT_LIB_LOCATION = "${pkgs.onnxruntime}";
+        ORT_STRATEGY = "system";
       };
 
       meta = with nixpkgs.lib; {
