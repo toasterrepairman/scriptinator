@@ -45,7 +45,15 @@ impl AppSettings {
 
         println!("Downloading model {} from HuggingFace...", selected_model);
         let api = Api::new()?;
-        let repo = api.model("ggerganov/whisper.cpp".to_string());
+
+        // Determine which repository to use based on the model
+        let repo_name = if selected_model.contains("kotoba") {
+            "kotoba-tech/kotoba-whisper-bilingual-v1.0-ggml"
+        } else {
+            "ggerganov/whisper.cpp"
+        };
+
+        let repo = api.model(repo_name.to_string());
         let model_file = repo.get(&selected_model)?;
 
         let path_str = model_file.to_string_lossy().to_string();
@@ -925,7 +933,12 @@ fn transcribe_with_whisper(audio_data: Vec<u8>, settings: &Arc<AppSettings>) -> 
     });
     params.set_suppress_nst(false);
     params.set_suppress_blank(true);
+
+    // For bilingual model, enable translation to English
+    // This will translate Japanese input to English text
+    params.set_translate(true);
     params.set_language(Some("en"));
+
     params.set_no_speech_thold(3.0);
     // Disable fallback temperatures (prevents hallucinations when uncertain)
     params.set_temperature_inc(0.0);
@@ -1028,7 +1041,8 @@ fn main() {
 
         let model_list = StringList::new(&[
             "ggml-small-q8_0.bin",
-            "ggml-large-v3-turbo-q8_0.bin"
+            "ggml-large-v3-turbo-q8_0.bin",
+            "ggml-kotoba-whisper-bilingual-v1.0-q5_0.bin"
         ]);
         let model_dropdown = DropDown::builder()
             .model(&model_list)
@@ -1042,6 +1056,7 @@ fn main() {
             let model_name = match selected_idx {
                 0 => "ggml-small-q8_0.bin",
                 1 => "ggml-large-v3-turbo-q8_0.bin",
+                2 => "ggml-kotoba-whisper-bilingual-v1.0-q5_0.bin",
                 _ => "ggml-small-q8_0.bin",
             };
             settings_clone_for_model.set_selected_model(model_name.to_string());
