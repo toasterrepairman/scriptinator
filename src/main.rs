@@ -1,21 +1,25 @@
-use gtk::prelude::*;
-use gtk::{Application, Box as GtkBox, Orientation, Label, ScrolledWindow, gdk, CssProvider, Align, DropDown, StringList, MenuButton, Popover, Button};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use chrono::Local;
 use gtk::glib;
+use gtk::prelude::*;
+use gtk::{
+    gdk, Align, Application, Box as GtkBox, Button, CssProvider, DropDown, Label, MenuButton,
+    Orientation, Popover, ScrolledWindow, StringList,
+};
+use hf_hub::api::sync::Api;
+use libadwaita::prelude::*;
+use libadwaita::{
+    ActionRow, ApplicationWindow as AdwApplicationWindow, HeaderBar, PreferencesGroup,
+};
+use std::collections::VecDeque;
+use std::io::{BufReader, Read};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use chrono::Local;
-use std::io::{Read, BufReader, BufRead};
-use libadwaita::prelude::*;
-use libadwaita::{HeaderBar, PreferencesGroup, ActionRow, ApplicationWindow as AdwApplicationWindow};
-use std::collections::VecDeque;
-use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
-use hf_hub::api::sync::Api;
+use std::thread;
+use std::time::{Duration, Instant};
 use voice_activity_detector::VoiceActivityDetector;
-
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 // --- Runtime-configurable Settings ---
 struct AppSettings {
@@ -85,32 +89,24 @@ impl PipeWireCapture {
         })
     }
 
-    fn start_recording_by_name(&mut self, node_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn start_recording_by_name(
+        &mut self,
+        node_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         println!("Recording from PipeWire stream: {}", node_name);
 
-        // FINAL APPROACH: Find the sink that the stream is connected to,
-        // then monitor that sink directly. This way we don't interfere with routing at all.
+        // Find the sink that the stream is connected to, then monitor that sink directly.
+        // This way we don't interfere with routing and capture exactly what the app is playing.
 
-        // First, find which sink input corresponds to this stream
-        println!("Finding sink for stream: {}", node_name);
-
-        let sink_input_output = Command::new("bash")
-            .args([
-                "-c",
-                // Get all sink inputs and find the one matching our stream
-                "pactl list sink-inputs | grep -B 20 'application.name = \"Firefox\"' | grep 'Sink:' | head -1 | awk '{print $2}'",
-            ])
-            .output()?;
-
-        let target_sink = String::from_utf8_lossy(&sink_input_output.stdout).trim().to_string();
+        let target_sink = self.find_sink_for_stream(node_name)?;
 
         if target_sink.is_empty() {
             eprintln!("Could not find sink for stream, will try direct capture");
             // Fallback: try to capture from default sink monitor
-            let default_sink_output = Command::new("pactl")
-                .args(["get-default-sink"])
-                .output()?;
-            let default_sink = String::from_utf8_lossy(&default_sink_output.stdout).trim().to_string();
+            let default_sink_output = Command::new("pactl").args(["get-default-sink"]).output()?;
+            let default_sink = String::from_utf8_lossy(&default_sink_output.stdout)
+                .trim()
+                .to_string();
 
             if !default_sink.is_empty() {
                 let monitor_name = format!("{}.monitor", default_sink);
@@ -135,7 +131,10 @@ impl PipeWireCapture {
             return Err("Could not determine audio sink".into());
         }
 
-        println!("Stream is connected to sink: {}", target_sink);
+        println!(
+            "Stream '{}' is connected to sink: {}",
+            node_name, target_sink
+        );
 
         // Monitor the sink directly - this captures everything playing to that sink
         let monitor_name = format!("{}.monitor", target_sink);
@@ -156,6 +155,195 @@ impl PipeWireCapture {
         self.child_process = Some(child);
         println!("Recording from sink monitor (capturing all audio on that sink)");
         Ok(())
+    }
+
+    // Find the sink name that a PipeWire stream node is connected to
+    fn find_sink_for_stream(&self, node_name: &str) -> Result<String, Box<dyn std::error::Error>> {
+        println!("Finding sink for PipeWire stream: {}", node_name);
+
+        // Use pw-dump to find the link between the stream and its sink
+        let output = Command::new("pw-dump").output()?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Parse the JSON to find:
+        // 1. The stream node ID (from node.name)
+        // 2. The link connecting stream output to sink input
+        // 3. The sink node ID from that link
+        // 4. The sink name from that node
+
+        let mut stream_node_id: Option<u32> = None;
+        let mut sink_node_id: Option<u32> = None;
+        let mut current_obj_id: Option<u32> = None;
+        let mut current_obj_type: Option<String> = None;
+        let mut current_node_name: Option<String> = None;
+        let mut current_link_output_node: Option<u32> = None;
+        let mut current_link_input_node: Option<u32> = None;
+        let mut in_props = false;
+
+        for line in stdout.lines() {
+            let line = line.trim();
+
+            // Track object ID
+            if line.starts_with("\"id\":") {
+                if let Some(colon_pos) = line.find(':') {
+                    let value_part = line[colon_pos + 1..].trim().trim_end_matches(',');
+                    if let Ok(id) = value_part.parse::<u32>() {
+                        current_obj_id = Some(id);
+                    }
+                }
+            }
+
+            // Detect object type
+            if line.contains("\"type\":") {
+                if let Some(value) = extract_json_string_value(line) {
+                    current_obj_type = Some(value);
+                }
+            }
+
+            // Detect props section
+            if line == "\"props\": {" || line == "\"props\":{" {
+                in_props = true;
+            } else if line.starts_with("\"link\":") || line == "}" || line == "}," {
+                in_props = false;
+            }
+
+            // Extract properties
+            if in_props {
+                if line.contains("\"node.name\":") {
+                    if let Some(value) = extract_json_string_value(line) {
+                        current_node_name = Some(value);
+                    }
+                } else if line.contains("\"link.output.node\":") {
+                    if let Some(colon_pos) = line.find(':') {
+                        let value_part = line[colon_pos + 1..].trim().trim_end_matches(',');
+                        if let Ok(id) = value_part.parse::<u32>() {
+                            current_link_output_node = Some(id);
+                        }
+                    }
+                } else if line.contains("\"link.input.node\":") {
+                    if let Some(colon_pos) = line.find(':') {
+                        let value_part = line[colon_pos + 1..].trim().trim_end_matches(',');
+                        if let Ok(id) = value_part.parse::<u32>() {
+                            current_link_input_node = Some(id);
+                        }
+                    }
+                }
+            }
+
+            // Process object at end (next line starts with new object or end of array)
+            if line.starts_with("{") || line == "]" {
+                // Process completed object
+                if let Some(obj_type) = current_obj_type.as_ref() {
+                    match obj_type.as_str() {
+                        "PipeWire:Interface:Node" => {
+                            // Check if this is our stream node
+                            if let Some(ref name) = current_node_name {
+                                if name == node_name {
+                                    if let Some(id) = current_obj_id {
+                                        stream_node_id = Some(id);
+                                        println!("Found stream node: {} (ID: {})", node_name, id);
+                                    }
+                                }
+                            }
+                        }
+                        "PipeWire:Interface:Link" => {
+                            // Check if this link connects our stream to a sink
+                            if let (Some(stream_id), Some(output_node), Some(input_node)) = (
+                                stream_node_id,
+                                current_link_output_node,
+                                current_link_input_node,
+                            ) {
+                                if output_node == stream_id {
+                                    // This link connects our stream output to the sink input
+                                    sink_node_id = Some(input_node);
+                                    println!(
+                                        "Found link from stream {} to sink node {}",
+                                        stream_id, input_node
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Reset for next object
+                current_obj_id = None;
+                current_obj_type = None;
+                current_node_name = None;
+                current_link_output_node = None;
+                current_link_input_node = None;
+                in_props = false;
+            }
+        }
+
+        // Now find the sink name from the sink node ID
+        if let Some(sink_id) = sink_node_id {
+            let output = Command::new("pw-dump").output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            let mut current_obj_id: Option<u32> = None;
+            let mut current_node_name: Option<String> = None;
+            let mut current_media_class: Option<String> = None;
+            let mut in_props = false;
+
+            for line in stdout.lines() {
+                let line = line.trim();
+
+                if line.starts_with("\"id\":") {
+                    if let Some(colon_pos) = line.find(':') {
+                        let value_part = line[colon_pos + 1..].trim().trim_end_matches(',');
+                        if let Ok(id) = value_part.parse::<u32>() {
+                            current_obj_id = Some(id);
+                        }
+                    }
+                }
+
+                if line == "\"props\": {" || line == "\"props\":{" {
+                    in_props = true;
+                } else if line == "}" || line == "}," {
+                    in_props = false;
+                }
+
+                if in_props {
+                    if line.contains("\"node.name\":") {
+                        if let Some(value) = extract_json_string_value(line) {
+                            current_node_name = Some(value);
+                        }
+                    } else if line.contains("\"media.class\":") {
+                        if let Some(value) = extract_json_string_value(line) {
+                            current_media_class = Some(value);
+                        }
+                    }
+                }
+
+                if line.starts_with("{") || line == "]" {
+                    if let Some(id) = current_obj_id {
+                        if id == sink_id {
+                            if let (Some(name), Some(media_class)) =
+                                (&current_node_name, &current_media_class)
+                            {
+                                // Check if this is a sink (Audio/Sink or similar)
+                                if media_class.contains("Sink") {
+                                    println!(
+                                        "Found sink: {} (ID: {}, class: {})",
+                                        name, id, media_class
+                                    );
+                                    return Ok(name.clone());
+                                }
+                            }
+                        }
+                    }
+                    current_obj_id = None;
+                    current_node_name = None;
+                    current_media_class = None;
+                    in_props = false;
+                }
+            }
+        }
+
+        Err(format!("Could not find sink for stream: {}", node_name).into())
     }
 
     fn stop_recording(&mut self) {
@@ -279,7 +467,10 @@ impl AudioCapture {
             return Ok(());
         }
 
-        println!("Starting continuous audio recording from device: {}", device);
+        println!(
+            "Starting continuous audio recording from device: {}",
+            device
+        );
 
         if device.starts_with("stream:") {
             let node_name = &device[7..];
@@ -287,7 +478,7 @@ impl AudioCapture {
             println!("Recording from PipeWire stream: {}", node_name);
 
             // Find the actual node ID
-            let node_id = match get_pipewire_node_id(node_name) {
+            let _node_id = match get_pipewire_node_id(node_name) {
                 Some(id) => {
                     println!("Found PipeWire node ID: {}", id);
                     id
@@ -309,12 +500,18 @@ impl AudioCapture {
             // Fallback to ffmpeg for regular PulseAudio devices
             let child = Command::new("ffmpeg")
                 .args([
-                    "-f", "pulse",
-                    "-i", device,
-                    "-f", "wav",
-                    "-ar", "16000",
-                    "-ac", "1",
-                    "-acodec", "pcm_s16le",
+                    "-f",
+                    "pulse",
+                    "-i",
+                    device,
+                    "-f",
+                    "wav",
+                    "-ar",
+                    "16000",
+                    "-ac",
+                    "1",
+                    "-acodec",
+                    "pcm_s16le",
                     "pipe:1",
                 ])
                 .stdin(Stdio::null())
@@ -395,7 +592,14 @@ impl AudioCapture {
         // Use VAD to detect speech/silence if we have enough data
         // Process recent 1 second of audio (16kHz * 2 bytes = 32000 bytes)
         if self.buffer.len() > 32_000 {
-            let recent_audio: Vec<u8> = self.buffer.iter().rev().take(32_000).rev().cloned().collect();
+            let recent_audio: Vec<u8> = self
+                .buffer
+                .iter()
+                .rev()
+                .take(32_000)
+                .rev()
+                .cloned()
+                .collect();
             let speech_probability = self.detect_speech_with_vad(&recent_audio);
 
             // Track speech and silence transitions
@@ -406,7 +610,9 @@ impl AudioCapture {
                 }
                 self.last_speech_detected = Instant::now();
             } else {
-                if self.speech_detected && self.last_speech_detected.elapsed() > self.silence_duration {
+                if self.speech_detected
+                    && self.last_speech_detected.elapsed() > self.silence_duration
+                {
                     println!("Silence detected (probability: {:.2})", speech_probability);
                     self.last_silence_detected = Instant::now();
                 }
@@ -415,8 +621,8 @@ impl AudioCapture {
 
         // Determine if we should process the buffer
         let min_buffer_met = self.buffer.len() > 96_000; // ~6 seconds minimum
-        let speech_then_silence = self.speech_detected &&
-                                   self.last_speech_detected.elapsed() > self.silence_duration;
+        let speech_then_silence =
+            self.speech_detected && self.last_speech_detected.elapsed() > self.silence_duration;
         let timeout_triggered = self.buffer_start_time.elapsed() >= self.max_buffer_duration;
 
         let should_process = min_buffer_met && (speech_then_silence || timeout_triggered);
@@ -430,7 +636,10 @@ impl AudioCapture {
 
             // Add overlap from previous transcription (if available)
             if !self.overlap_buffer.is_empty() {
-                println!("Adding {} bytes of overlap from previous chunk", self.overlap_buffer.len());
+                println!(
+                    "Adding {} bytes of overlap from previous chunk",
+                    self.overlap_buffer.len()
+                );
                 audio_data.extend_from_slice(&self.overlap_buffer);
             }
 
@@ -504,8 +713,7 @@ fn get_running_applications() -> Vec<(String, String)> {
     println!("Getting active audio streams...");
 
     // Use pw-dump for more reliable JSON output
-    let output = Command::new("pw-dump")
-        .output();
+    let output = Command::new("pw-dump").output();
 
     let mut streams = Vec::new();
 
@@ -519,7 +727,7 @@ fn get_running_applications() -> Vec<(String, String)> {
             // 2. node.name exists
             // 3. Has an active port connection (state = "running" or has ports)
 
-            let mut current_object: Option<String> = None;
+            let mut _current_object: Option<String> = None;
             let mut current_node_name: Option<String> = None;
             let mut current_app_name: Option<String> = None;
             let mut current_media_name: Option<String> = None;
@@ -534,10 +742,15 @@ fn get_running_applications() -> Vec<(String, String)> {
                 // Detect new object start
                 if line.starts_with("{") && !in_info && !in_props {
                     // Save previous object if it was a valid stream
-                    if let (Some(node_name), Some(media_class)) = (&current_node_name, &current_media_class) {
+                    if let (Some(node_name), Some(media_class)) =
+                        (&current_node_name, &current_media_class)
+                    {
                         if media_class == "Stream/Output/Audio" {
                             // Only include streams that are running or have state information
-                            let is_active = current_state.as_ref().map(|s| s == "running").unwrap_or(true);
+                            let is_active = current_state
+                                .as_ref()
+                                .map(|s| s == "running")
+                                .unwrap_or(true);
 
                             if is_active {
                                 let display_name = match (&current_app_name, &current_media_name) {
@@ -553,7 +766,7 @@ fn get_running_applications() -> Vec<(String, String)> {
                     }
 
                     // Reset for new object
-                    current_object = Some(String::new());
+                    _current_object = Some(String::new());
                     current_node_name = None;
                     current_app_name = None;
                     current_media_name = None;
@@ -604,7 +817,10 @@ fn get_running_applications() -> Vec<(String, String)> {
             // Check last object
             if let (Some(node_name), Some(media_class)) = (current_node_name, current_media_class) {
                 if media_class == "Stream/Output/Audio" {
-                    let is_active = current_state.as_ref().map(|s| s == "running").unwrap_or(true);
+                    let is_active = current_state
+                        .as_ref()
+                        .map(|s| s == "running")
+                        .unwrap_or(true);
 
                     if is_active {
                         let display_name = match (current_app_name, current_media_name) {
@@ -652,9 +868,7 @@ fn extract_json_string_value(line: &str) -> Option<String> {
 fn get_pipewire_node_id(node_name: &str) -> Option<String> {
     println!("Looking up PipeWire node ID for: {}", node_name);
 
-    let output = Command::new("pw-dump")
-        .output()
-        .ok()?;
+    let output = Command::new("pw-dump").output().ok()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -729,7 +943,10 @@ fn get_pipewire_node_id(node_name: &str) -> Option<String> {
 }
 
 fn find_pipewire_node_by_app_name(app_name: &str) -> Option<Vec<String>> {
-    println!("Looking for PipeWire nodes with application name: {}", app_name);
+    println!(
+        "Looking for PipeWire nodes with application name: {}",
+        app_name
+    );
 
     let output = Command::new("pw-cli")
         .args(["list-objects"])
@@ -774,14 +991,22 @@ fn find_pipewire_node_by_app_name(app_name: &str) -> Option<Vec<String>> {
             // Extract node.name
             if line.contains("node.name =") {
                 if let Some(name_part) = line.split("node.name = ").nth(1) {
-                    current_node_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+                    current_node_name = Some(
+                        name_part
+                            .trim_matches(|c| c == '"' || c == ',' || c == ' ')
+                            .to_string(),
+                    );
                 }
             }
 
             // Extract application.name
             if line.contains("application.name =") {
                 if let Some(name_part) = line.split("application.name = ").nth(1) {
-                    current_app_name = Some(name_part.trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+                    current_app_name = Some(
+                        name_part
+                            .trim_matches(|c| c == '"' || c == ',' || c == ' ')
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -801,7 +1026,11 @@ fn find_pipewire_node_by_app_name(app_name: &str) -> Option<Vec<String>> {
         println!("No PipeWire nodes found for application: {}", app_name);
         None
     } else {
-        println!("Found {} PipeWire node(s) for application: {}", matching_nodes.len(), app_name);
+        println!(
+            "Found {} PipeWire node(s) for application: {}",
+            matching_nodes.len(),
+            app_name
+        );
         Some(matching_nodes)
     }
 }
@@ -833,13 +1062,15 @@ fn find_sink_input_by_app_name(app_name: &str) -> Option<String> {
         }
 
         if line.starts_with("application.name = ") {
-            current_app = line.split(" = ")
+            current_app = line
+                .split(" = ")
                 .nth(1)
                 .map(|s| s.trim_matches('"').to_string());
         }
 
         if line.starts_with("media.name = ") && current_app.is_none() {
-            current_app = line.split(" = ")
+            current_app = line
+                .split(" = ")
                 .nth(1)
                 .map(|s| s.trim_matches('"').to_string());
         }
@@ -921,10 +1152,8 @@ fn transcribe_with_whisper(audio_data: Vec<u8>, settings: &Arc<AppSettings>) -> 
         }
     };
 
-    let ctx = WhisperContext::new_with_params(
-        &model_path,
-        WhisperContextParameters::default()
-    ).expect("failed to load model");
+    let ctx = WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
+        .expect("failed to load model");
 
     // Create params with suppress_non_speech enabled
     let mut params = FullParams::new(SamplingStrategy::BeamSearch {
@@ -946,7 +1175,6 @@ fn transcribe_with_whisper(audio_data: Vec<u8>, settings: &Arc<AppSettings>) -> 
     params.set_initial_prompt("");
     // Set probability thresholds
     params.set_max_initial_ts(1.0);
-
 
     // Create state and run transcription
     let mut state = ctx.create_state().expect("failed to create state");
@@ -976,6 +1204,7 @@ fn main() {
         let running = Arc::new(AtomicBool::new(false));
         let settings = Arc::new(AppSettings::new());
         let devices = get_audio_devices();
+        let running_apps = get_running_applications();
         let default_source = get_default_source();
         let main_vbox = GtkBox::new(Orientation::Vertical, 0);
 
@@ -1010,19 +1239,42 @@ fn main() {
         let audio_row = ActionRow::new();
         audio_row.set_title("Audio Input Device");
 
-        let device_list = StringList::new(&[]);
+        // Create combined list: first devices, then running applications
+        let mut combined_devices: Vec<String> = Vec::new();
+        let mut display_names: Vec<String> = Vec::new();
         let mut default_index = 0;
+
+        // Add system audio devices
         for (idx, device) in devices.iter().enumerate() {
-            device_list.append(device);
+            combined_devices.push(device.clone());
+            display_names.push(device.clone());
             if let Some(ref default) = default_source {
                 if device == default {
-                    default_index = idx as u32;
+                    default_index = idx;
                 }
             }
         }
+
+        // Add running applications with stream: prefix
+        let app_offset = devices.len();
+        for (idx, (display_name, node_name)) in running_apps.iter().enumerate() {
+            let stream_device = format!("stream:{}", node_name);
+            combined_devices.push(stream_device.clone());
+            display_names.push(display_name.clone());
+            if let Some(ref default) = default_source {
+                if stream_device == *default {
+                    default_index = app_offset + idx;
+                }
+            }
+        }
+
+        let device_list = StringList::new(&[]);
+        for name in &display_names {
+            device_list.append(name);
+        }
         let device_dropdown = DropDown::builder()
             .model(&device_list)
-            .selected(default_index)
+            .selected(default_index as u32)
             .valign(Align::Center)
             .build();
 
@@ -1353,6 +1605,7 @@ fn main() {
 
         let running_clone_for_thread = Arc::clone(&running);
         let settings_clone_for_thread = Arc::clone(&settings);
+        let combined_devices_for_thread = combined_devices.clone();
         thread::spawn(move || {
             let mut audio_capture = AudioCapture::new();
             let default_device = "default".to_string();
@@ -1363,7 +1616,9 @@ fn main() {
                         if should_run {
                             // Use the selected audio device
                             let device_index = selected_device_index.load(Ordering::Relaxed);
-                            let device_to_use = devices.get(device_index).unwrap_or(&default_device).clone();
+                            let device_to_use = combined_devices_for_thread.get(device_index)
+                                .unwrap_or(&default_device)
+                                .clone();
 
                             if let Err(e) = audio_capture.start_recording(&device_to_use) {
                                 println!("Failed to start recording: {}", e);
